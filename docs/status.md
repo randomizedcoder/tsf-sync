@@ -42,22 +42,32 @@
   - [x] Clean module exit with PTP clock unregistration
 - [x] **Integration test implementations** — hwsim_test.rs with 6 tests (discovery, PTP registration, read/write, ptp4l convergence, 100-radio stress, config generation)
 
-### Not Yet Verified (requires root + kernel headers)
+### Verified with root + kernel headers (2026-03-30)
 
-- [ ] **Validate foundation** — run `sudo kernel/tests/validate_hwsim_tsf.sh` (needs root)
-- [ ] **Build kernel module** — `make` in `kernel/` (needs kernel 6.19.9 dev headers)
-- [ ] **Run integration test** — `sudo kernel/tests/test_hwsim.sh` (needs built module + root)
-- [ ] **Run Rust integration tests** — `sudo cargo test --test hwsim_test -- --ignored` (needs root + modules)
+- [x] **Build kernel module** — `make` against kernel 6.19.9 headers (via nix)
+- [x] **PTP clock registration** — tsf_ptp.ko registers PTP clocks via hot-plug (NETDEV_REGISTER notifier)
+- [x] **Discovery finds PTP clocks** — `tsf-sync discover` shows all hwsim radios with `/dev/ptpN`
+- [x] **Config generation** — `tsf-sync config` generates valid ptp4l config (serverOnly for primary)
+- [x] **Local clock sync** — `tsf-sync start` spawns phc2sys processes; clocks converge to ±500ns (1µs TSF resolution limit)
+- [x] **Clean shutdown** — Ctrl-C stops all phc2sys processes
 
 - [x] **Hot-plug support** — NETDEV_REGISTER probes new wiphys, NETDEV_UNREGISTER removes PTP clocks when wiphy goes away
 - [x] **Deployment guide** — complete `docs/deployment.md` with NixOS, DKMS, manual install, configuration, verification, troubleshooting
 - [x] **NixOS kernel module build** — `nix/kernel-module.nix` for building tsf-ptp against current kernel, wired into NixOS module
 
-### Next Steps
+### Key fixes during verification
 
-- [ ] **Validate foundation** — run `sudo kernel/tests/validate_hwsim_tsf.sh` (needs root)
-- [ ] **Build kernel module for running kernel** — needs 6.19.9 headers
-- [ ] **Run integration tests** — `sudo kernel/tests/test_hwsim.sh` and `sudo cargo test --test hwsim_test -- --ignored`
+- PTP clocks appear at `device/ptpN` in sysfs, not `device/ptp/ptpN`
+- Must register PTP clock with `wiphy->dev.parent` (HW device), not `wiphy_dev(wiphy)` (wiphy device)
+- `max_adj` must be non-zero for phc2sys to consider clock adjustable; `adjfine` returns 0 (no-op)
+- Phase 1 uses phc2sys (direct PHC-to-PHC sync), not ptp4l (requires ethtool on network interfaces)
+- linuxptp 4.x: `masterOnly`→`serverOnly`, `slaveOnly`→`clientOnly` (global only)
+
+### Not Yet Verified
+
+- [ ] **Validate foundation** — run `sudo kernel/tests/validate_hwsim_tsf.sh`
+- [ ] **Run shell integration test** — `sudo kernel/tests/test_hwsim.sh`
+- [ ] **Run Rust integration tests** — `sudo cargo test --test hwsim_test -- --ignored`
 - [ ] **Real hardware test** — Intel AX210 (native PTP) + MediaTek MT7925 (tsf-ptp module)
 
 ---
