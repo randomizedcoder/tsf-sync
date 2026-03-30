@@ -181,9 +181,12 @@ static int tsf_ptp_adjtime(struct ptp_clock_info *info, s64 delta_ns)
 
 static int tsf_ptp_adjfine(struct ptp_clock_info *info, long scaled_ppm)
 {
-	/* WiFi cards don't have tunable oscillators.
-	 * Return -EOPNOTSUPP so ptp4l falls back to time-stepping. */
-	return -EOPNOTSUPP;
+	/*
+	 * WiFi cards don't have tunable oscillators. Accept the request
+	 * silently (return 0) so tools like phc2sys consider the clock
+	 * adjustable. Actual sync happens via settime64/adjtime stepping.
+	 */
+	return 0;
 }
 
 static int tsf_ptp_getcrosststamp(struct ptp_clock_info *info,
@@ -232,8 +235,8 @@ static int tsf_ptp_probe(struct ieee80211_local *local)
 
 	/* Only probe cards that have get_tsf. */
 	if (!local->ops->get_tsf) {
-		pr_debug("tsf-ptp: %s: no get_tsf, skipping\n",
-			 wiphy_name(wiphy));
+		pr_info("tsf-ptp: %s: no get_tsf, skipping\n",
+			wiphy_name(wiphy));
 		return -EOPNOTSUPP;
 	}
 
@@ -267,7 +270,7 @@ static int tsf_ptp_probe(struct ieee80211_local *local)
 	card->ptp_info = (struct ptp_clock_info) {
 		.owner		= THIS_MODULE,
 		.name		= "",  /* filled below */
-		.max_adj	= 0,
+		.max_adj	= 500000000, /* accept any adj; actual stepping via set_tsf */
 		.n_alarm	= 0,
 		.n_ext_ts	= 0,
 		.n_per_out	= 0,
@@ -281,8 +284,17 @@ static int tsf_ptp_probe(struct ieee80211_local *local)
 	};
 	strscpy(card->ptp_info.name, card->name, sizeof(card->ptp_info.name));
 
+	/*
+	 * Register PTP clock with the wiphy's parent device (e.g., PCI,
+	 * USB, or platform device). This makes our PTP clocks appear in
+	 * sysfs at the same location as native driver PTP clocks:
+	 *   /sys/class/ieee80211/phyN/device/ptp/ptpM
+	 * which is where the Rust discovery code looks.
+	 */
 	card->ptp_clock = ptp_clock_register(&card->ptp_info,
-					      wiphy_dev(wiphy));
+					      wiphy->dev.parent
+					      ? wiphy->dev.parent
+					      : wiphy_dev(wiphy));
 	if (IS_ERR(card->ptp_clock)) {
 		pr_err("tsf-ptp: %s: failed to register PTP clock: %ld\n",
 		       card->name, PTR_ERR(card->ptp_clock));

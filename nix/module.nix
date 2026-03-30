@@ -54,7 +54,7 @@ in
 
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${cfg.package}/bin/tsf-sync daemon --primary ${cfg.primaryCard} --interval ${cfg.interval} --log-level ${cfg.logLevel}";
+        ExecStart = "${cfg.package}/bin/tsf-sync daemon --primary ${cfg.primaryCard} --interval ${cfg.interval} --log-level ${cfg.logLevel} --linuxptp-path ${pkgs.linuxptp}/bin/ptp4l";
         Restart = "on-failure";
         RestartSec = 5;
 

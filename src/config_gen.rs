@@ -46,16 +46,15 @@ pub fn generate_config(
     writeln!(config, "priority1               128").unwrap();
     writeln!(config, "priority2               128").unwrap();
     writeln!(config, "domainNumber            42").unwrap();
-    writeln!(config, "slaveOnly               0").unwrap();
     writeln!(config).unwrap();
 
     // Primary card — grandmaster.
     let ptp_path = primary.ptp_clock.as_ref().unwrap();
     writeln!(config, "# Primary: {} ({})", primary.phy, primary.driver).unwrap();
     writeln!(config, "[{}]", ptp_path.display()).unwrap();
-    writeln!(config, "masterOnly              1").unwrap();
+    writeln!(config, "serverOnly              1").unwrap();
 
-    // Secondary cards — slaves.
+    // Secondary cards — clients.
     for card in &ptp_cards {
         if card.phy == primary.phy {
             continue;
@@ -64,14 +63,13 @@ pub fn generate_config(
         writeln!(config).unwrap();
         writeln!(config, "# Secondary: {} ({})", card.phy, card.driver).unwrap();
         writeln!(config, "[{}]", ptp_path.display()).unwrap();
-        writeln!(config, "slaveOnly               1").unwrap();
     }
 
     Ok(config)
 }
 
 /// Select the primary card based on user preference or auto-selection.
-fn select_primary<'a>(
+pub fn select_primary<'a>(
     ptp_cards: &[&'a WifiCard],
     selection: &str,
 ) -> Result<&'a WifiCard, ConfigError> {
@@ -129,10 +127,9 @@ mod tests {
         assert!(config.contains("clockClass              248"));
         assert!(config.contains("domainNumber            42"));
         assert!(config.contains("[/dev/ptp0]"));
-        assert!(config.contains("masterOnly              1"));
+        assert!(config.contains("serverOnly              1"));
         assert!(config.contains("[/dev/ptp1]"));
         assert!(config.contains("[/dev/ptp2]"));
-        assert!(config.contains("slaveOnly               1"));
     }
 
     #[test]
@@ -144,10 +141,10 @@ mod tests {
 
         let config = generate_config(&cards, "auto").unwrap();
 
-        // Intel (ptp0) should be primary (masterOnly), mt76 (ptp1) should be slave.
+        // Intel (ptp0) should be primary (serverOnly), mt76 (ptp1) should be slave.
         let master_pos = config.find("[/dev/ptp0]").unwrap();
-        let master_only_pos = config[master_pos..].find("masterOnly").unwrap();
-        assert!(master_only_pos < 50); // masterOnly should be right after the section header
+        let master_only_pos = config[master_pos..].find("serverOnly").unwrap();
+        assert!(master_only_pos < 50); // serverOnly should be right after the section header
     }
 
     #[test]
@@ -161,7 +158,7 @@ mod tests {
 
         // phy1 should be primary.
         let master_pos = config.find("[/dev/ptp1]").unwrap();
-        let master_only_pos = config[master_pos..].find("masterOnly").unwrap();
+        let master_only_pos = config[master_pos..].find("serverOnly").unwrap();
         assert!(master_only_pos < 50);
     }
 
@@ -207,7 +204,7 @@ mod tests {
         // Should pick first available (phy0).
         let config = generate_config(&cards, "auto").unwrap();
         let master_pos = config.find("[/dev/ptp0]").unwrap();
-        let master_only = config[master_pos..].find("masterOnly").unwrap();
+        let master_only = config[master_pos..].find("serverOnly").unwrap();
         assert!(master_only < 50);
     }
 

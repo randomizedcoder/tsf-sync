@@ -7,11 +7,12 @@ pkgs.mkShell {
     pkgs.cargo-nextest
   ];
 
-  # Optional system tools for hardware testing
+  # System tools for testing and runtime
   nativeBuildInputs = with pkgs; [
+    linuxptp       # ptp4l, phc_ctl, pmc — required at runtime
     iw
     ethtool
-    linuxPackages.perf
+    kmod           # modprobe, insmod, rmmod
   ];
 
   RUST_BACKTRACE = "1";

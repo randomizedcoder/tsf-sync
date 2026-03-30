@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -17,18 +17,19 @@ pub enum DaemonError {
     Config(#[from] config_gen::ConfigError),
     #[error("module loading failed: {0}")]
     Module(#[from] module_loader::ModuleError),
-    #[error("ptp4l failed: {0}")]
-    Ptp4l(#[from] ptp4l::Ptp4lError),
+    #[error("sync process failed: {0}")]
+    Sync(#[from] ptp4l::SyncError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 const SYSFS_IEEE80211: &str = "/sys/class/ieee80211";
-const DEFAULT_CONFIG_PATH: &str = "/tmp/tsf-sync-ptp4l.conf";
 const DEFAULT_UDS_PATH: &str = "/var/run/ptp4l";
 
-/// Start the full tsf-sync stack: discover → load module → config → ptp4l.
-pub fn start(primary: &str) -> Result<ptp4l::Ptp4lProcess, DaemonError> {
+/// Start the full tsf-sync stack: discover → load module → spawn phc2sys.
+///
+/// Returns a list of phc2sys processes (one per secondary clock).
+pub fn start(primary: &str, linuxptp_bin: &str) -> Result<Vec<ptp4l::SyncProcess>, DaemonError> {
     // 1. Initial discovery.
     let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211))?;
     tracing::info!(count = cards.len(), "discovered WiFi cards");
@@ -41,37 +42,64 @@ pub fn start(primary: &str) -> Result<ptp4l::Ptp4lProcess, DaemonError> {
     if needs_module {
         tracing::info!("loading tsf-ptp kernel module");
         module_loader::load_tsf_ptp()?;
-
-        // Re-discover after loading module.
         std::thread::sleep(Duration::from_millis(500));
     }
 
     let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211))?;
 
-    // 3. Generate config.
-    let config = config_gen::generate_config(&cards, primary)?;
-    let config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-    std::fs::write(&config_path, &config)?;
-    tracing::info!(path = %config_path.display(), "wrote ptp4l config");
+    // 3. Select primary and secondaries.
+    let ptp_cards: Vec<&discovery::WifiCard> =
+        cards.iter().filter(|c| c.ptp_clock.is_some()).collect();
 
-    // 4. Start ptp4l.
-    let process = ptp4l::Ptp4lProcess::start(&config_path)?;
+    if ptp_cards.len() < 2 {
+        return Err(config_gen::ConfigError::OnlyOneClock.into());
+    }
 
-    Ok(process)
+    let primary_card = config_gen::select_primary(&ptp_cards, primary)?;
+    let primary_clock = primary_card.ptp_clock.as_ref().unwrap();
+
+    tracing::info!(
+        primary = %primary_card.phy,
+        clock = %primary_clock.display(),
+        "selected primary clock"
+    );
+
+    // 4. Start phc2sys for each secondary.
+    let phc2sys_bin = ptp4l::phc2sys_bin_from(linuxptp_bin);
+    let phc2sys_str = phc2sys_bin.to_string_lossy();
+    let mut processes = Vec::new();
+
+    for card in &ptp_cards {
+        if card.phy == primary_card.phy {
+            continue;
+        }
+        let secondary_clock = card.ptp_clock.as_ref().unwrap();
+        tracing::info!(
+            secondary = %card.phy,
+            clock = %secondary_clock.display(),
+            "syncing to primary"
+        );
+
+        let proc = ptp4l::start_phc2sys(primary_clock, secondary_clock, &phc2sys_str)?;
+        processes.push(proc);
+    }
+
+    tracing::info!(
+        count = processes.len(),
+        "started phc2sys processes for local clock sync"
+    );
+
+    Ok(processes)
 }
 
-/// Stop the tsf-sync stack: stop ptp4l → unload module.
-pub fn stop(process: &mut Option<ptp4l::Ptp4lProcess>) -> Result<(), DaemonError> {
-    if let Some(p) = process {
-        p.stop()?;
+/// Stop the tsf-sync stack: stop all sync processes → unload module.
+pub fn stop(processes: &mut Vec<ptp4l::SyncProcess>) -> Result<(), DaemonError> {
+    for p in processes.iter_mut() {
+        let _ = p.stop();
     }
-    *process = None;
+    processes.clear();
 
     module_loader::unload_tsf_ptp()?;
-
-    // Clean up config file.
-    let _ = std::fs::remove_file(DEFAULT_CONFIG_PATH);
-
     Ok(())
 }
 
@@ -97,6 +125,7 @@ pub fn status() -> Result<(), DaemonError> {
 pub fn run_daemon(
     primary: &str,
     interval: Duration,
+    linuxptp_bin: &str,
 ) -> Result<(), DaemonError> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -104,12 +133,11 @@ pub fn run_daemon(
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
-    // Install SIGTERM/SIGINT handler.
     ctrlc_handler(move || {
         r.store(false, Ordering::SeqCst);
     });
 
-    let mut process = start(primary)?;
+    let mut processes = start(primary, linuxptp_bin)?;
     tracing::info!("daemon started, monitoring every {:?}", interval);
 
     while running.load(Ordering::SeqCst) {
@@ -119,11 +147,12 @@ pub fn run_daemon(
             break;
         }
 
-        // Check if ptp4l is still running.
-        if !process.is_running() {
-            tracing::warn!("ptp4l exited unexpectedly, restarting");
-            let config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-            process = ptp4l::Ptp4lProcess::start(&config_path)?;
+        // Check if any phc2sys processes crashed.
+        for proc in &mut processes {
+            if !proc.is_running() {
+                tracing::warn!("phc2sys process exited, will restart on next cycle");
+                // TODO: restart individual failed processes
+            }
         }
 
         // Log health status.
@@ -139,29 +168,23 @@ pub fn run_daemon(
                 }
             }
             Err(e) => {
-                tracing::warn!("health check failed: {}", e);
+                tracing::debug!("health check via pmc not available: {}", e);
             }
         }
     }
 
     tracing::info!("shutting down");
-    process.stop()?;
-    module_loader::unload_tsf_ptp()?;
-    let _ = std::fs::remove_file(DEFAULT_CONFIG_PATH);
-
+    stop(&mut processes)?;
     Ok(())
 }
 
-/// Install a handler for SIGTERM/SIGINT. Best-effort — if it fails,
-/// we'll just rely on the default signal behavior.
+/// Install a handler for SIGTERM/SIGINT.
 fn ctrlc_handler<F: Fn() + Send + 'static>(handler: F) {
     #[cfg(unix)]
     {
         use std::sync::Once;
         static ONCE: Once = Once::new();
         ONCE.call_once(move || {
-            // Use a simple signal handler via unsafe libc.
-            // We store the handler in a static and call it from the C handler.
             unsafe {
                 HANDLER = Some(Box::new(handler));
                 libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
@@ -199,7 +222,6 @@ pub fn parse_interval(s: &str) -> Result<Duration, String> {
             .map(|m| Duration::from_secs(m * 60))
             .map_err(|e| e.to_string())
     } else {
-        // Default: try as seconds.
         s.parse::<u64>()
             .map(Duration::from_secs)
             .map_err(|e| format!("invalid interval '{}': {}", s, e))

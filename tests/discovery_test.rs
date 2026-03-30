@@ -19,9 +19,11 @@ fn create_mock_phy(root: &Path, phy_name: &str, driver_name: &str, ptp_clock: Op
         symlink(&driver_target, &driver_link).unwrap();
     }
 
-    // Create PTP clock if specified.
+    // Create PTP clock entry if specified.
+    // In real sysfs, PTP clocks appear as direct children of the
+    // device (e.g., device/ptp0), not in a ptp/ subdirectory.
     if let Some(ptp) = ptp_clock {
-        let ptp_dir = device_dir.join("ptp").join(ptp);
+        let ptp_dir = device_dir.join(ptp);
         fs::create_dir_all(&ptp_dir).unwrap();
     }
 }

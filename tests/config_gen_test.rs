@@ -29,13 +29,13 @@ fn test_single_primary_n_secondaries() {
     assert!(config.contains("clockClass              248"));
     assert!(config.contains("domainNumber            42"));
 
-    // Intel should be auto-selected as primary.
-    assert!(config.contains("[/dev/ptp0]\nmasterOnly"));
+    // Intel should be auto-selected as primary (serverOnly).
+    assert!(config.contains("[/dev/ptp0]\nserverOnly"));
 
-    // All others should be slaves.
-    assert!(config.contains("[/dev/ptp1]\nslaveOnly"));
-    assert!(config.contains("[/dev/ptp2]\nslaveOnly"));
-    assert!(config.contains("[/dev/ptp3]\nslaveOnly"));
+    // All others should be secondaries (no per-port role — ptp4l auto-negotiates).
+    assert!(config.contains("[/dev/ptp1]"));
+    assert!(config.contains("[/dev/ptp2]"));
+    assert!(config.contains("[/dev/ptp3]"));
 }
 
 #[test]
@@ -47,10 +47,10 @@ fn test_auto_prefers_intel() {
 
     let config = config_gen::generate_config(&cards, "auto").unwrap();
 
-    // Intel's PTP clock should be masterOnly.
+    // Intel's PTP clock should be serverOnly.
     let ptp0_pos = config.find("[/dev/ptp0]").unwrap();
     let after_ptp0 = &config[ptp0_pos..];
-    assert!(after_ptp0.starts_with("[/dev/ptp0]\nmasterOnly"));
+    assert!(after_ptp0.starts_with("[/dev/ptp0]\nserverOnly"));
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn test_explicit_primary_selection() {
 
     let ptp1_pos = config.find("[/dev/ptp1]").unwrap();
     let after_ptp1 = &config[ptp1_pos..];
-    assert!(after_ptp1.starts_with("[/dev/ptp1]\nmasterOnly"));
+    assert!(after_ptp1.starts_with("[/dev/ptp1]\nserverOnly"));
 }
 
 #[test]

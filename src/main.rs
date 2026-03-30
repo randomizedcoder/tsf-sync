@@ -14,6 +14,11 @@ struct Cli {
     #[arg(short, long, default_value = "info", global = true)]
     log_level: String,
 
+    /// Path to a linuxptp binary (ptp4l or phc2sys). Used to locate the
+    /// linuxptp install — phc2sys is derived from the same directory.
+    #[arg(long, default_value = "ptp4l", global = true)]
+    linuxptp_path: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -71,7 +76,7 @@ fn main() {
         )
         .init();
 
-    let result = run(cli.command);
+    let result = run(cli.command, &cli.linuxptp_path);
 
     if let Err(e) = result {
         tracing::error!("{}", e);
@@ -79,7 +84,7 @@ fn main() {
     }
 }
 
-fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+fn run(command: Command, linuxptp_bin: &str) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Discover => {
             let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211))?;
@@ -106,10 +111,8 @@ fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Start { primary } => {
-            let _process = daemon::start(&primary)?;
-            tracing::info!("tsf-sync started. Use 'tsf-sync stop' to shut down.");
-            // In non-daemon mode, just keep running until interrupted.
-            // The ptp4l process will be stopped on Drop.
+            let _processes = daemon::start(&primary, linuxptp_bin)?;
+            tracing::info!("tsf-sync started. Press Ctrl-C to stop.");
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
             }
@@ -120,13 +123,13 @@ fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Stop => {
-            daemon::stop(&mut None)?;
+            daemon::stop(&mut Vec::new())?;
         }
 
         Command::Daemon { primary, interval } => {
             let interval = daemon::parse_interval(&interval)
                 .map_err(|e| format!("invalid interval: {}", e))?;
-            daemon::run_daemon(&primary, interval)?;
+            daemon::run_daemon(&primary, interval, linuxptp_bin)?;
         }
     }
 

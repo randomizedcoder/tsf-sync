@@ -101,32 +101,34 @@ fn read_driver(phy_path: &Path) -> String {
     }
 }
 
-/// Find PTP clock for a phy. Checks device/ptp/ for native clocks,
-/// then falls back to checking if the driver is known to have native PTP.
+/// Find PTP clock for a phy. Scans the device directory (and the phy
+/// directory itself) for entries named "ptpN". PTP clock devices appear
+/// as direct children of their parent device in sysfs (e.g.,
+/// `device/ptp0`), not in a `ptp/` subdirectory.
 fn find_ptp_clock(phy_path: &Path, driver: &str) -> (Option<PathBuf>, PtpSource) {
-    let ptp_dir = phy_path.join("device/ptp");
+    // Check directories where PTP clock entries may appear:
+    // 1. device/ — PTP clocks registered with the HW device (native or tsf-ptp)
+    // 2. ./ — fallback if registered with the wiphy device itself
+    let search_dirs = [phy_path.join("device"), phy_path.to_path_buf()];
 
-    if let Ok(entries) = fs::read_dir(&ptp_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("ptp") {
-                let dev_path = PathBuf::from(format!("/dev/{}", name));
-                let source = if NATIVE_PTP_DRIVERS.contains(&driver) {
-                    PtpSource::Native
-                } else {
-                    PtpSource::TsfPtp
-                };
-                return (Some(dev_path), source);
+    for dir in &search_dirs {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("ptp") {
+                    let dev_path = PathBuf::from(format!("/dev/{}", name));
+                    let source = if NATIVE_PTP_DRIVERS.contains(&driver) {
+                        PtpSource::Native
+                    } else {
+                        PtpSource::TsfPtp
+                    };
+                    return (Some(dev_path), source);
+                }
             }
         }
     }
 
-    // No PTP clock found.
-    if FULLMAC_DRIVERS.contains(&driver) {
-        (None, PtpSource::None)
-    } else {
-        (None, PtpSource::None)
-    }
+    (None, PtpSource::None)
 }
 
 /// Format discovered cards as a table for display.
@@ -201,9 +203,11 @@ mod tests {
         fs::create_dir_all(&driver_target).unwrap();
         symlink(&driver_target, device_dir.join("driver")).unwrap();
 
-        // Create PTP clock if specified.
+        // Create PTP clock entry if specified.
+        // In real sysfs, PTP clocks appear as direct children of the
+        // device (e.g., device/ptp0), not in a ptp/ subdirectory.
         if let Some(ptp) = ptp_clock {
-            let ptp_dir = device_dir.join("ptp").join(ptp);
+            let ptp_dir = device_dir.join(ptp);
             fs::create_dir_all(&ptp_dir).unwrap();
         }
     }
