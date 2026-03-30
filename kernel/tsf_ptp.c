@@ -56,6 +56,30 @@ MODULE_AUTHOR("tsf-sync contributors");
 MODULE_DESCRIPTION("Expose WiFi TSF as PTP hardware clocks");
 MODULE_VERSION("0.1.0");
 
+static unsigned int adjtime_threshold_ns = 5000;
+module_param(adjtime_threshold_ns, uint, 0644);
+MODULE_PARM_DESC(adjtime_threshold_ns,
+	"Skip set_tsf if abs(delta) < this value in ns (default: 5000 = 5us)");
+
+static atomic64_t adjtime_skip_count = ATOMIC64_INIT(0);
+static atomic64_t adjtime_apply_count = ATOMIC64_INIT(0);
+
+static int param_get_atomic64(char *buffer, const struct kernel_param *kp)
+{
+	atomic64_t *val = kp->arg;
+	return sysfs_emit(buffer, "%lld\n", atomic64_read(val));
+}
+
+static const struct kernel_param_ops param_ops_atomic64 = {
+	.get = param_get_atomic64,
+};
+
+module_param_cb(adjtime_skip_count, &param_ops_atomic64, &adjtime_skip_count, 0444);
+MODULE_PARM_DESC(adjtime_skip_count, "Number of adjtime calls skipped (below threshold)");
+
+module_param_cb(adjtime_apply_count, &param_ops_atomic64, &adjtime_apply_count, 0444);
+MODULE_PARM_DESC(adjtime_apply_count, "Number of adjtime calls applied");
+
 /* Global list of all registered cards. Protected by cards_lock. */
 static LIST_HEAD(cards_list);
 static DEFINE_MUTEX(cards_lock);
@@ -158,6 +182,12 @@ static int tsf_ptp_adjtime(struct ptp_clock_info *info, s64 delta_ns)
 	struct ieee80211_vif *vif;
 	u64 tsf_usec;
 	s64 delta_usec;
+	unsigned int threshold = READ_ONCE(adjtime_threshold_ns);
+
+	if (threshold > 0 && (delta_ns < 0 ? -delta_ns : delta_ns) < threshold) {
+		atomic64_inc(&adjtime_skip_count);
+		return 0;
+	}
 
 	mutex_lock(&card->lock);
 	vif = card->vif;
@@ -176,6 +206,7 @@ static int tsf_ptp_adjtime(struct ptp_clock_info *info, s64 delta_ns)
 	wiphy_unlock(card->hw->wiphy);
 	mutex_unlock(&card->lock);
 
+	atomic64_inc(&adjtime_apply_count);
 	return 0;
 }
 

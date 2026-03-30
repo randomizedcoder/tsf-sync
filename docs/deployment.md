@@ -21,13 +21,12 @@
 {
   services.tsf-sync = {
     enable = true;
-    primaryCard = "auto";   # or "phy0" to pin a specific card
-    interval = "10s";       # health check interval
-    logLevel = "info";      # trace, debug, info, warn, error
+    primaryCard = "auto";          # or "phy0" to pin a specific card
+    interval = "10s";              # health check interval
+    adjtimeThresholdNs = 5000;     # skip set_tsf below this (see docs/wifi-timing.md)
+    logLevel = "info";             # trace, debug, info, warn, error
+    loadKernelModule = true;       # auto-load tsf-ptp module
   };
-
-  # Load the tsf-ptp kernel module
-  boot.extraModulePackages = [ pkgs.tsf-ptp-module ];
 }
 ```
 

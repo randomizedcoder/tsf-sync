@@ -8,6 +8,30 @@ Bridge WiFi TSF (Timing Synchronization Function) into the Linux PTP (Precision 
 
 ---
 
+## Quick Start (NixOS)
+
+```bash
+# Build everything
+nix build                         # Rust binary
+nix build .#kernel-module         # Kernel module for your running kernel
+
+# Enter development shell (Rust + linuxptp + kernel headers)
+nix develop
+
+# Run automated smoke test (loads hwsim, tests threshold, cleans up)
+sudo nix run .#test-hwsim
+
+# Run sync and monitor counters for 30 seconds
+sudo nix run .#test-sync
+
+# CI checks (fmt + clippy + test + build)
+nix flake check
+```
+
+See [Nix Reference](docs/nix.md) for all flake outputs, NixOS module configuration, and test scripts.
+
+---
+
 ## How It Works
 
 Intel's `iwlwifi` driver already exposes its WiFi TSF as a PTP hardware clock. Our job is to extend this pattern to every other WiFi driver — about 20 Linux SoftMAC drivers gain PTP support through a single kernel module.
@@ -115,9 +139,11 @@ tsf-sync/
 │
 ├── nix/                               # NixOS packaging
 │   ├── package.nix                    # Crane-based Rust build
-│   ├── devshell.nix                   # Development shell
-│   ├── ci.nix                         # CI checks
-│   └── module.nix                     # NixOS service module
+│   ├── kernel-module.nix              # Kernel module build
+│   ├── devshell.nix                   # Development shell (Rust + kernel headers)
+│   ├── ci.nix                         # CI checks (fmt, clippy, test, build)
+│   ├── module.nix                     # NixOS service module (systemd)
+│   └── scripts.nix                    # Test/build helper scripts
 │
 ├── flake.nix
 ├── Cargo.toml
@@ -159,10 +185,12 @@ tsf-sync/
 | [Kernel Module: tsf-ptp](docs/kernel-module.md) | Module design, PTP↔mac80211 mapping, challenges | Complete |
 | [Userspace Tool: tsf-sync](docs/userspace-tool.md) | CLI, daemon mode, discovery, config generation | Complete |
 | [PTP Topology & Scaling](docs/ptp-topology.md) | Single-host, multi-host, GPS input configurations | Complete |
+| [WiFi Timing Requirements](docs/wifi-timing.md) | 802.11 timing, sync accuracy targets, threshold tuning | Complete |
 | [Testing Strategy](docs/testing.md) | mac80211_hwsim, integration tests, test matrix | Complete |
 | [Error Handling](docs/error-handling.md) | Error classification, health state machine, monitoring | Complete |
 | [Options Considered](docs/options-considered.md) | Alternatives evaluated and why they were rejected | Complete |
-| [Deployment Guide](docs/deployment.md) | NixOS module, DKMS, manual setup | Placeholder — Phase 1 |
+| [Nix Reference](docs/nix.md) | Flake outputs, dev shell, test scripts, NixOS module, CI | Complete |
+| [Deployment Guide](docs/deployment.md) | NixOS module, DKMS, manual setup | Complete |
 | [Multi-Host Operations](docs/multi-host.md) | Cross-host PTP setup, network requirements | Placeholder — Phase 2 |
 | [Upstream Roadmap](docs/upstream.md) | Per-driver PTP patches, kernel maintainer engagement | Placeholder — Phase 3 |
 

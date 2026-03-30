@@ -44,6 +44,11 @@ enum Command {
         /// Primary card phy name or "auto".
         #[arg(short, long, default_value = "auto")]
         primary: String,
+
+        /// Skip set_tsf if offset is below this threshold (nanoseconds).
+        /// 0 disables. Default 5000 (5µs). See docs/wifi-timing.md for tuning guidance.
+        #[arg(long, default_value = "5000")]
+        adjtime_threshold_ns: u64,
     },
 
     /// Show sync health for all cards.
@@ -61,6 +66,11 @@ enum Command {
         /// Health check interval.
         #[arg(short, long, default_value = "10s")]
         interval: String,
+
+        /// Skip set_tsf if offset is below this threshold (nanoseconds).
+        /// 0 disables. Default 5000 (5µs). See docs/wifi-timing.md for tuning guidance.
+        #[arg(long, default_value = "5000")]
+        adjtime_threshold_ns: u64,
     },
 }
 
@@ -110,8 +120,8 @@ fn run(command: Command, linuxptp_bin: &str) -> Result<(), Box<dyn std::error::E
             }
         }
 
-        Command::Start { primary } => {
-            let _processes = daemon::start(&primary, linuxptp_bin)?;
+        Command::Start { primary, adjtime_threshold_ns } => {
+            let _processes = daemon::start(&primary, linuxptp_bin, adjtime_threshold_ns)?;
             tracing::info!("tsf-sync started. Press Ctrl-C to stop.");
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -126,10 +136,10 @@ fn run(command: Command, linuxptp_bin: &str) -> Result<(), Box<dyn std::error::E
             daemon::stop(&mut Vec::new())?;
         }
 
-        Command::Daemon { primary, interval } => {
+        Command::Daemon { primary, interval, adjtime_threshold_ns } => {
             let interval = daemon::parse_interval(&interval)
                 .map_err(|e| format!("invalid interval: {}", e))?;
-            daemon::run_daemon(&primary, interval, linuxptp_bin)?;
+            daemon::run_daemon(&primary, interval, linuxptp_bin, adjtime_threshold_ns)?;
         }
     }
 

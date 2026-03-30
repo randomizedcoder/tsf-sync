@@ -29,7 +29,7 @@ const DEFAULT_UDS_PATH: &str = "/var/run/ptp4l";
 /// Start the full tsf-sync stack: discover → load module → spawn phc2sys.
 ///
 /// Returns a list of phc2sys processes (one per secondary clock).
-pub fn start(primary: &str, linuxptp_bin: &str) -> Result<Vec<ptp4l::SyncProcess>, DaemonError> {
+pub fn start(primary: &str, linuxptp_bin: &str, adjtime_threshold_ns: u64) -> Result<Vec<ptp4l::SyncProcess>, DaemonError> {
     // 1. Initial discovery.
     let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211))?;
     tracing::info!(count = cards.len(), "discovered WiFi cards");
@@ -41,7 +41,7 @@ pub fn start(primary: &str, linuxptp_bin: &str) -> Result<Vec<ptp4l::SyncProcess
 
     if needs_module {
         tracing::info!("loading tsf-ptp kernel module");
-        module_loader::load_tsf_ptp()?;
+        module_loader::load_tsf_ptp(adjtime_threshold_ns)?;
         std::thread::sleep(Duration::from_millis(500));
     }
 
@@ -121,11 +121,19 @@ pub fn status() -> Result<(), DaemonError> {
     Ok(())
 }
 
+/// Read an adjtime counter from sysfs.
+fn read_adjtime_counter(name: &str) -> Option<i64> {
+    std::fs::read_to_string(format!("/sys/module/tsf_ptp/parameters/{}", name))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
 /// Run the daemon loop: start stack, monitor, handle signals.
 pub fn run_daemon(
     primary: &str,
     interval: Duration,
     linuxptp_bin: &str,
+    adjtime_threshold_ns: u64,
 ) -> Result<(), DaemonError> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -137,7 +145,7 @@ pub fn run_daemon(
         r.store(false, Ordering::SeqCst);
     });
 
-    let mut processes = start(primary, linuxptp_bin)?;
+    let mut processes = start(primary, linuxptp_bin, adjtime_threshold_ns)?;
     tracing::info!("daemon started, monitoring every {:?}", interval);
 
     while running.load(Ordering::SeqCst) {
@@ -153,6 +161,18 @@ pub fn run_daemon(
                 tracing::warn!("phc2sys process exited, will restart on next cycle");
                 // TODO: restart individual failed processes
             }
+        }
+
+        // Log adjtime threshold counters.
+        if let (Some(skip), Some(apply)) = (
+            read_adjtime_counter("adjtime_skip_count"),
+            read_adjtime_counter("adjtime_apply_count"),
+        ) {
+            tracing::info!(
+                skipped = skip,
+                applied = apply,
+                "adjtime threshold stats"
+            );
         }
 
         // Log health status.

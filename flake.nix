@@ -35,9 +35,20 @@
         package = import ./nix/package.nix { inherit craneLib commonArgs cargoArtifacts; };
         checks = import ./nix/ci.nix { inherit craneLib commonArgs cargoArtifacts src; };
         devShell = import ./nix/devshell.nix { inherit pkgs rustToolchain; };
+
+        # Kernel module built against the host's running kernel.
+        # Use linuxPackages (matches the running NixOS kernel) by default.
+        kernelModule = pkgs.linuxPackages.callPackage ./nix/kernel-module.nix {};
+
+        # Helper scripts
+        scripts = import ./nix/scripts.nix { inherit pkgs kernelModule package; };
       in
       {
-        packages.default = package;
+        packages = {
+          default = package;
+          tsf-sync = package;
+          kernel-module = kernelModule;
+        } // scripts;
 
         checks = checks;
 

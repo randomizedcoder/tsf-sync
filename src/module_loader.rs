@@ -42,9 +42,10 @@ pub fn is_tsf_ptp_loaded() -> Result<bool, ModuleError> {
 }
 
 /// Load a kernel module via modprobe.
-pub fn load_module(module: &str) -> Result<(), ModuleError> {
+pub fn load_module(module: &str, params: &[&str]) -> Result<(), ModuleError> {
     let output = Command::new("modprobe")
         .arg(module)
+        .args(params)
         .output()
         .map_err(ModuleError::Exec)?;
 
@@ -58,9 +59,10 @@ pub fn load_module(module: &str) -> Result<(), ModuleError> {
 }
 
 /// Load a kernel module via insmod (for out-of-tree modules).
-pub fn insmod(path: &str) -> Result<(), ModuleError> {
+pub fn insmod(path: &str, params: &[&str]) -> Result<(), ModuleError> {
     let output = Command::new("insmod")
         .arg(path)
+        .args(params)
         .output()
         .map_err(ModuleError::Exec)?;
 
@@ -75,14 +77,17 @@ pub fn insmod(path: &str) -> Result<(), ModuleError> {
 
 /// Load the tsf-ptp module. Tries modprobe first, falls back to insmod
 /// from the known build location.
-pub fn load_tsf_ptp() -> Result<(), ModuleError> {
+pub fn load_tsf_ptp(adjtime_threshold_ns: u64) -> Result<(), ModuleError> {
     if is_tsf_ptp_loaded()? {
         tracing::info!("tsf-ptp module already loaded");
         return Ok(());
     }
 
+    let threshold_param = format!("adjtime_threshold_ns={}", adjtime_threshold_ns);
+    let params = [threshold_param.as_str()];
+
     // Try modprobe first (works if installed via DKMS/modules_install).
-    match load_module(MODULE_NAME) {
+    match load_module(MODULE_NAME, &params) {
         Ok(()) => return Ok(()),
         Err(e) => tracing::debug!("modprobe failed, will try insmod: {}", e),
     }
@@ -90,7 +95,7 @@ pub fn load_tsf_ptp() -> Result<(), ModuleError> {
     // Try insmod from project directory.
     let module_path = "kernel/tsf_ptp.ko";
     if std::path::Path::new(module_path).exists() {
-        insmod(module_path)
+        insmod(module_path, &params)
     } else {
         Err(ModuleError::Modprobe(format!(
             "tsf_ptp module not found via modprobe or at {}",

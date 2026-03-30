@@ -22,6 +22,12 @@ in
       description = "Health check interval.";
     };
 
+    adjtimeThresholdNs = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 5000;
+      description = "Skip set_tsf if offset is below this threshold (nanoseconds). 0 disables. Default 5000 (5µs). See docs/wifi-timing.md for tuning guidance.";
+    };
+
     logLevel = lib.mkOption {
       type = lib.types.enum [ "trace" "debug" "info" "warn" "error" ];
       default = "info";
@@ -54,7 +60,7 @@ in
 
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${cfg.package}/bin/tsf-sync daemon --primary ${cfg.primaryCard} --interval ${cfg.interval} --log-level ${cfg.logLevel} --linuxptp-path ${pkgs.linuxptp}/bin/ptp4l";
+        ExecStart = "${cfg.package}/bin/tsf-sync daemon --primary ${cfg.primaryCard} --interval ${cfg.interval} --adjtime-threshold-ns ${toString cfg.adjtimeThresholdNs} --log-level ${cfg.logLevel} --linuxptp-path ${pkgs.linuxptp}/bin/ptp4l";
         Restart = "on-failure";
         RestartSec = 5;
 

@@ -1,5 +1,11 @@
 # Architecture & Design Rationale
 
+## Use Case: Coordinated WiFi APs
+
+tsf-sync targets deployments where a single Linux host runs multiple WiFi NICs in AP mode. Synchronizing their TSF clocks enables seamless client roaming, coordinated contention windows, and reduced inter-AP interference in the shared RF environment. See [WiFi Timing Requirements](wifi-timing.md) for detailed analysis of 802.11 timing constraints and the ≤10 µs accuracy target.
+
+---
+
 ## Core Insight
 
 Intel's `iwlwifi` driver already exposes its WiFi TSF as a PTP hardware clock (`/dev/ptpN`). This means `ptp4l` can already synchronize Intel WiFi cards using standard IEEE 1588 — no custom code needed.
