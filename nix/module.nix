@@ -4,6 +4,7 @@ self:
 
 let
   cfg = config.services.tsf-sync;
+  tsf-ptp-module = config.boot.kernelPackages.callPackage ./kernel-module.nix {};
 in
 {
   options.services.tsf-sync = {
@@ -44,8 +45,7 @@ in
     # Ensure linuxptp is available for ptp4l/phc2sys/pmc
     environment.systemPackages = [ pkgs.linuxptp ];
 
-    # TODO: Add tsf-ptp kernel module to boot.extraModulePackages
-    # boot.extraModulePackages = lib.mkIf cfg.loadKernelModule [ tsf-ptp-module ];
+    boot.extraModulePackages = lib.mkIf cfg.loadKernelModule [ tsf-ptp-module ];
 
     systemd.services.tsf-sync = {
       description = "WiFi TSF-to-PTP Bridge Daemon";

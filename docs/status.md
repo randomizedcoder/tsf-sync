@@ -49,12 +49,16 @@
 - [ ] **Run integration test** — `sudo kernel/tests/test_hwsim.sh` (needs built module + root)
 - [ ] **Run Rust integration tests** — `sudo cargo test --test hwsim_test -- --ignored` (needs root + modules)
 
+- [x] **Hot-plug support** — NETDEV_REGISTER probes new wiphys, NETDEV_UNREGISTER removes PTP clocks when wiphy goes away
+- [x] **Deployment guide** — complete `docs/deployment.md` with NixOS, DKMS, manual install, configuration, verification, troubleshooting
+- [x] **NixOS kernel module build** — `nix/kernel-module.nix` for building tsf-ptp against current kernel, wired into NixOS module
+
 ### Next Steps
 
+- [ ] **Validate foundation** — run `sudo kernel/tests/validate_hwsim_tsf.sh` (needs root)
+- [ ] **Build kernel module for running kernel** — needs 6.19.9 headers
+- [ ] **Run integration tests** — `sudo kernel/tests/test_hwsim.sh` and `sudo cargo test --test hwsim_test -- --ignored`
 - [ ] **Real hardware test** — Intel AX210 (native PTP) + MediaTek MT7925 (tsf-ptp module)
-- [ ] **Hot-plug support** — kernel notifier for phy add/remove → PTP clock register/unregister
-- [ ] **Write deployment guide** — fill in `docs/deployment.md`
-- [ ] **NixOS kernel module build** — `nix/kernel-module.nix` for building tsf-ptp against current kernel
 
 ---
 

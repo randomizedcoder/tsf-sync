@@ -332,10 +332,80 @@ static struct tsf_ptp_card *find_card_by_wiphy_locked(struct wiphy *wiphy)
 }
 
 /**
+ * Try to probe a wiphy we haven't seen before (hot-plug).
+ * Called from the netdev notifier when a new wireless net_device
+ * appears. If the wiphy's mac80211 hw has get_tsf and we haven't
+ * registered it yet, register a new PTP clock.
+ */
+static void tsf_ptp_try_hotplug_probe(struct wiphy *wiphy)
+{
+	struct ieee80211_local *local;
+
+	/* Already tracked? */
+	mutex_lock(&cards_lock);
+	if (find_card_by_wiphy_locked(wiphy)) {
+		mutex_unlock(&cards_lock);
+		return;
+	}
+	mutex_unlock(&cards_lock);
+
+	local = wiphy_priv(wiphy);
+	if (!local)
+		return;
+
+	if (tsf_ptp_probe(local) == 0)
+		pr_info("tsf-ptp: hot-plug: registered PTP clock for %s\n",
+			wiphy_name(wiphy));
+}
+
+/**
+ * Remove a card if its wiphy is going away.
+ * Called when the last net_device for a wiphy is unregistered.
+ * We check if any other net_devices still reference this wiphy;
+ * if not, remove the PTP clock.
+ */
+static void tsf_ptp_try_hotplug_remove(struct wiphy *wiphy)
+{
+	struct tsf_ptp_card *card;
+	struct net_device *dev;
+	bool wiphy_still_has_netdev = false;
+
+	/*
+	 * Check if any other net_device still uses this wiphy.
+	 * We're called from the notifier which holds rtnl_lock,
+	 * so for_each_netdev is safe.
+	 */
+	for_each_netdev(&init_net, dev) {
+		if (dev->ieee80211_ptr &&
+		    dev->ieee80211_ptr->wiphy == wiphy) {
+			wiphy_still_has_netdev = true;
+			break;
+		}
+	}
+
+	if (wiphy_still_has_netdev)
+		return;
+
+	mutex_lock(&cards_lock);
+	card = find_card_by_wiphy_locked(wiphy);
+	if (card) {
+		list_del(&card->list);
+		mutex_unlock(&cards_lock);
+		tsf_ptp_remove(card);
+		pr_info("tsf-ptp: hot-unplug: removed PTP clock for %s\n",
+			wiphy_name(wiphy));
+		return;
+	}
+	mutex_unlock(&cards_lock);
+}
+
+/**
  * Netdevice notifier callback.
  *
- * When a wireless interface comes up, we capture its VIF pointer.
- * When it goes down, we clear it. PTP ops return -ENODEV without a VIF.
+ * Handles three concerns:
+ * 1. Hot-plug: NETDEV_REGISTER → probe new wiphys
+ * 2. VIF lifecycle: NETDEV_UP/DOWN → capture/release VIF pointer
+ * 3. Hot-unplug: NETDEV_UNREGISTER → remove PTP clock if wiphy gone
  */
 static int tsf_ptp_netdev_event(struct notifier_block *nb,
 				unsigned long event, void *ptr)
@@ -353,43 +423,74 @@ static int tsf_ptp_netdev_event(struct notifier_block *nb,
 	if (!wiphy)
 		return NOTIFY_DONE;
 
-	mutex_lock(&cards_lock);
-	card = find_card_by_wiphy_locked(wiphy);
-	if (!card) {
-		mutex_unlock(&cards_lock);
-		return NOTIFY_DONE;
-	}
-
-	sdata = IEEE80211_DEV_TO_SUB_IF(dev);
-	if (!sdata) {
-		mutex_unlock(&cards_lock);
-		return NOTIFY_DONE;
-	}
-
 	switch (event) {
+	case NETDEV_REGISTER:
+		/*
+		 * New wireless net_device appeared. If this wiphy is
+		 * new to us (hot-plugged card), probe it.
+		 */
+		tsf_ptp_try_hotplug_probe(wiphy);
+		break;
+
 	case NETDEV_UP:
-		mutex_lock(&card->lock);
-		if (!card->vif) {
-			card->vif = &sdata->vif;
-			pr_info("tsf-ptp: %s: VIF up (%s)\n",
-				card->name, dev->name);
+		mutex_lock(&cards_lock);
+		card = find_card_by_wiphy_locked(wiphy);
+		if (card) {
+			sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+			if (sdata) {
+				mutex_lock(&card->lock);
+				if (!card->vif) {
+					card->vif = &sdata->vif;
+					pr_info("tsf-ptp: %s: VIF up (%s)\n",
+						card->name, dev->name);
+				}
+				mutex_unlock(&card->lock);
+			}
 		}
-		mutex_unlock(&card->lock);
+		mutex_unlock(&cards_lock);
 		break;
 
 	case NETDEV_DOWN:
-	case NETDEV_UNREGISTER:
-		mutex_lock(&card->lock);
-		if (card->vif == &sdata->vif) {
-			card->vif = NULL;
-			pr_info("tsf-ptp: %s: VIF down (%s)\n",
-				card->name, dev->name);
+		mutex_lock(&cards_lock);
+		card = find_card_by_wiphy_locked(wiphy);
+		if (card) {
+			sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+			if (sdata) {
+				mutex_lock(&card->lock);
+				if (card->vif == &sdata->vif) {
+					card->vif = NULL;
+					pr_info("tsf-ptp: %s: VIF down (%s)\n",
+						card->name, dev->name);
+				}
+				mutex_unlock(&card->lock);
+			}
 		}
-		mutex_unlock(&card->lock);
+		mutex_unlock(&cards_lock);
+		break;
+
+	case NETDEV_UNREGISTER:
+		/* Clear VIF first. */
+		mutex_lock(&cards_lock);
+		card = find_card_by_wiphy_locked(wiphy);
+		if (card) {
+			sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+			if (sdata) {
+				mutex_lock(&card->lock);
+				if (card->vif == &sdata->vif) {
+					card->vif = NULL;
+					pr_info("tsf-ptp: %s: VIF unregistered (%s)\n",
+						card->name, dev->name);
+				}
+				mutex_unlock(&card->lock);
+			}
+		}
+		mutex_unlock(&cards_lock);
+
+		/* Then check if this was the last netdev for the wiphy. */
+		tsf_ptp_try_hotplug_remove(wiphy);
 		break;
 	}
 
-	mutex_unlock(&cards_lock);
 	return NOTIFY_DONE;
 }
 
