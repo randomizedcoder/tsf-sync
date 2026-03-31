@@ -18,6 +18,22 @@ Once every WiFi card is a PTP clock, the entire problem reduces to standard PTP 
 
 ---
 
+## PTP as Transport, Not Wall-Clock
+
+Traditional PTP synchronizes wall-clock time (UTC/TAI) across network devices. We use the PTP kernel API for a fundamentally different purpose: synchronizing BSS phase (WiFi TSF counters) between co-located radios on the same host. There is no wall clock involved.
+
+The key design decisions that make this work:
+
+- **`-O 0` (no UTC/TAI offset).** `phc2sys` normally applies a UTC-TAI offset when disciplining clocks. We pass `-O 0` because both source and destination are raw TSF values in the same counter domain — there is no wall-clock conversion to perform. This makes `phc2sys` operate as a pure TSF-to-TSF offset corrector.
+
+- **`adjfine` returns 0 (no-op).** WiFi cards have fixed-frequency oscillators — there is no hardware knob to tune the clock rate. When `phc2sys` calls `adjfine` to apply frequency correction, our module accepts the call silently (returning 0) but does nothing. This means PTP cannot run as a PLL (phase-locked loop); all correction happens via time-stepping through `adjtime`.
+
+- **`adjtime` is read-modify-write.** No WiFi driver implements `offset_tsf` (add a delta). Our `tsf_ptp_adjtime()` reads the current TSF, adds the offset, and writes the result back via `set_tsf`. A threshold filter skips the write when the offset is small enough, avoiding unnecessary PCIe transactions in steady state.
+
+The result is that `phc2sys` operates purely as a **polling-based offset corrector**: sample the primary, sample each secondary, compute the difference, step-correct if above threshold. PTP's clock discipline algorithms (PI controller, frequency estimation) are present but have no effect — frequency adjustment is a no-op, and all correction is time-stepping.
+
+---
+
 ## What We Build vs What Upstream Provides
 
 ### We build
@@ -38,9 +54,9 @@ Once every WiFi card is a PTP clock, the entire problem reduces to standard PTP 
 
 ---
 
-## Why PTP Wins
+## Why Reuse the PTP Ecosystem
 
-We evaluated several alternative architectures. The comparison:
+We evaluated several alternative architectures. PTP is the vehicle for delivering TSF sync, not the end goal — the question is whether reusing PTP infrastructure beats building a custom sync protocol. The comparison:
 
 | Approach | Intra-host sync | Multi-host sync | Maintenance burden | Accuracy |
 |----------|----------------|----------------|-------------------|----------|
@@ -49,7 +65,7 @@ We evaluated several alternative architectures. The comparison:
 | Custom daemon + channels | Thread-per-card, crossbeam channels | Custom protocol needed | Full sync protocol + per-card threads | ~1ms |
 | Async daemon (tokio) | spawn_blocking (all ops block) | Custom protocol needed | Async complexity for zero benefit | ~1ms |
 
-**The PTP approach wins decisively:**
+**Reusing the PTP ecosystem wins decisively:**
 
 1. **We write less code.** ~500 lines of kernel C + ~2000 lines of Rust orchestration vs ~5000+ lines of custom sync daemon.
 2. **We maintain less code.** We don't implement: clock discipline algorithms, frequency estimation, delay measurement, best-master-clock election, multi-host messaging, or any synchronization protocol.

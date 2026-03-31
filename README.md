@@ -1,8 +1,8 @@
 # tsf-sync
 
-Bridge WiFi TSF (Timing Synchronization Function) into the Linux PTP (Precision Time Protocol) subsystem, enabling standard PTP infrastructure (`ptp4l`, `phc2sys`) to synchronize TSF across any number of WiFi cards and hosts.
+Synchronize WiFi TSF (Timing Synchronization Function) phase across co-located Access Points on a single concentrator host. One radio is the timing master; the rest are secondaries. The host reads the master's TSF, computes the offset to each secondary, and corrects them via the driver's `set_tsf` — a classic master/slave clock discipline loop.
 
-**Approach:** Make every WiFi card look like a PTP hardware clock (`/dev/ptpN`). Let the mature, battle-tested PTP ecosystem handle synchronization — from a single host up to datacenter-scale multi-host deployments.
+While reviewing the kernel source, we discovered that Intel ships PTP hardware clock support as a [first-class feature of their WiFi NICs](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/intel/iwlwifi/mvm/ptp.c) — the `iwlwifi` driver registers each card's TSF as a `/dev/ptpN` clock with cross-timestamping, frequency adjustment, and GP2 hardware counter integration. Rather than building a custom synchronization daemon, we extended this pattern to every other SoftMAC WiFi driver and reuse the Linux PTP ecosystem (`phc2sys`) to drive the read → compare → correct loop. PTP is the transport mechanism, not the goal — see [This Is Not Traditional PTP](#this-is-not-traditional-ptp).
 
 **Current hardware:** 24 WiFi cards (Intel AX210 + MediaTek MT7925), scaling to 60-100+ per host, multiple hosts.
 
@@ -32,35 +32,222 @@ See [Nix Reference](docs/nix.md) for all flake outputs, NixOS module configurati
 
 ---
 
+## This Is Not Traditional PTP
+
+**Traditional PTP** synchronizes wall-clock time (UTC/TAI) across network devices — NICs, switches, grandmasters with GPS receivers. The goal is nanosecond-accurate wall-clock agreement.
+
+**What we do** is fundamentally different: we synchronize BSS phase (the WiFi TSF counter) between co-located radios on the same host. There is no wall clock involved.
+
+We repurpose the PTP kernel API (`ptp_clock_info`) as a **transport mechanism** to expose each radio's TSF read/write ops to userspace. `phc2sys` runs with `-O 0` (no UTC/TAI offset) — it sees raw TSF values and drives TSF-to-TSF convergence.
+
+The sync loop is functionally: `read master TSF → read slave TSF → compute offset → set_tsf on slave`. PTP infrastructure handles the bookkeeping; our kernel module does the actual TSF access.
+
+We chose this approach because the PTP clock API is a stable, well-maintained kernel interface for "expose a hardware clock and let userspace discipline it." That's exactly our use case — WiFi TSF is a hardware clock.
+
+---
+
+## Data Flow: How TSF Moves Through the System
+
+### Sync cycle (one iteration, one secondary)
+
+Shows how a TSF value is read from the primary NIC, travels through kernel and userspace, and results in a correction written to the secondary NIC. All NICs are PCIe-attached.
+
+```
+                    Userspace                          Kernel                        PCIe Bus            Hardware
+                    ─────────                          ──────                        ────────            ────────
+
+ ┌─ Step 1: Sample primary TSF ──────────────────────────────────────────────────────────────────────────────────┐
+ │                                                                                                               │
+ │  phc2sys                                                                                                      │
+ │  clock_gettime(/dev/ptp0) ──► PTP subsystem ──► tsf_ptp_gettime() ──► ops->get_tsf() ══► MMIO read ──► NIC 0 │
+ │                           ◄── tsf_usec ◄─────── tsf_usec ◄────────── tsf_usec ◄════════ TSF register          │
+ │                                                                                                               │
+ └───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ ┌─ Step 2: Sample secondary TSF ────────────────────────────────────────────────────────────────────────────────┐
+ │                                                                                                               │
+ │  phc2sys                                                                                                      │
+ │  clock_gettime(/dev/ptp1) ──► PTP subsystem ──► tsf_ptp_gettime() ──► ops->get_tsf() ══► MMIO read ──► NIC 1 │
+ │                           ◄── tsf_usec ◄─────── tsf_usec ◄────────── tsf_usec ◄════════ TSF register          │
+ │                                                                                                               │
+ └───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ ┌─ Step 3: Compute offset (pure math, no I/O) ─┐
+ │                                                │
+ │  phc2sys                                       │
+ │  offset = primary_tsf - secondary_tsf          │
+ │                                                │
+ └────────────────────────────────────────────────┘
+
+ ┌─ Step 4: Correct secondary TSF ───────────────────────────────────────────────────────────────────────────────┐
+ │                                                                                                               │
+ │  phc2sys                                                                                                      │
+ │  clock_adjtime(/dev/ptp1,     PTP subsystem     tsf_ptp_adjtime(delta_ns):                                    │
+ │    offset_ns)  ─────────────►  ─────────────►     if |delta| < threshold → skip (no PCIe)                     │
+ │                                                   else:                                                       │
+ │                                                     ops->get_tsf()  ══════════► MMIO read  ──► NIC 1          │
+ │                                                     tsf_usec ◄══════════════════ TSF register                  │
+ │                                                     new_tsf = tsf + delta                                     │
+ │                                                     ops->set_tsf()  ══════════► MMIO write ──► NIC 1          │
+ │                                                                                  TSF register updated          │
+ └───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Repeats every 100 ms (10 Hz).  With N secondaries, Steps 2-4 repeat for each.
+```
+
+### PCIe bus topology and transaction counts
+
+```
+ ┌──────────┐
+ │   CPU    │
+ │          │
+ └────┬─────┘
+      │  system bus
+ ┌────┴──────────────────┐
+ │  PCIe Root Complex    │
+ └──┬─────┬─────┬────┬──┘
+    │     │     │    │   PCIe lanes
+  ┌─┴──┐┌─┴──┐┌─┴──┐┌┴───┐
+  │NIC0││NIC1││NIC2││ ...│
+  │ptp0││ptp1││ptp2││    │
+  │MSTR││SLV ││SLV ││    │
+  └────┘└────┘└────┘└────┘
+
+ PCIe transactions per 100 ms sync cycle:
+ ┌────────────────────────────────────────────────────────────┐
+ │ Per-secondary card:                                        │
+ │   1× MMIO read  on master NIC  (Step 1: sample primary)   │
+ │   1× MMIO read  on this NIC    (Step 2: sample secondary) │
+ │   1× MMIO read  on this NIC    (Step 4: adjtime get_tsf)  │
+ │   1× MMIO write on this NIC    (Step 4: adjtime set_tsf)  │
+ │   ─────────────────────────────────────────────────────    │
+ │   = 4 PCIe transactions per secondary per cycle            │
+ │                                                            │
+ │ If |offset| < threshold (steady state):                    │
+ │   Skips Step 4 entirely → only 2 PCIe transactions         │
+ │   (1 read master + 1 read secondary)                       │
+ │                                                            │
+ │ For N secondaries:                                         │
+ │   Converging: 1 + 3N transactions (master read shared)     │
+ │   Steady state: 1 + N transactions                         │
+ │                                                            │
+ │ Example: 23 secondary cards                                │
+ │   Converging: 1 + 69 = 70 PCIe transactions / 100 ms      │
+ │   Steady:     1 + 23 = 24 PCIe transactions / 100 ms      │
+ └────────────────────────────────────────────────────────────┘
+
+ Transaction latency by driver type:
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ Register-based (ath9k, rtw88):                                   │
+ │   CPU ──► PCIe TLP ──► NIC MMIO register ──► PCIe TLP ──► CPU   │
+ │   Latency: 1-10 µs round-trip                                   │
+ │                                                                  │
+ │ Firmware-based (ath10k, mt76):                                   │
+ │   CPU ──► PCIe TLP ──► NIC cmd queue ──► firmware processes      │
+ │       ◄── PCIe TLP ◄── NIC event queue ◄── firmware responds     │
+ │   Latency: 10-500 µs round-trip                                  │
+ │                                                                  │
+ │ Native PTP (iwlwifi):                                            │
+ │   CPU ──► PCIe TLP ──► GP2 hardware counter ──► PCIe TLP ──► CPU│
+ │   Latency: < 1 µs round-trip                                    │
+ └──────────────────────────────────────────────────────────────────┘
+```
+
+PTP is just the ioctl plumbing between userspace and kernel — the actual work is MMIO reads/writes to NIC TSF registers over PCIe. The same reads and writes would happen in a pure in-kernel loop. The threshold filter eliminates most PCIe traffic in steady state — once clocks converge, only sampling transactions occur, not corrections.
+
+---
+
+## Timing Loop Placement
+
+The sync loop can run in userspace or entirely in-kernel. Here are the tradeoffs:
+
+**Current: Userspace (`phc2sys` at 10 Hz)** — `phc2sys` polls both clocks, computes the offset, and calls `clock_adjtime` via ioctl. The kernel module translates `adjtime` → `get_tsf` + offset + `set_tsf`.
+
+**Alternative: Entirely in-kernel (kernel timer or workqueue)** — A kernel timer or workqueue could call the same `get_tsf`/`set_tsf` ops directly. No context switch, no userspace scheduling jitter.
+
+| Aspect | Userspace (current) | In-kernel |
+|--------|-------------------|-----------|
+| **Latency** | ~10-100 µs scheduling jitter from context switch | Sub-µs, no context switch |
+| **Sufficient for target?** | Yes — target is ≤10 µs TSF alignment; polling jitter is noise relative to driver-level `get_tsf` latency (1-500 µs) | Would matter for sub-µs targets |
+| **Fault isolation** | Bug crashes a userspace process, not the kernel. Systemd restarts it. | Bug can panic/lock the kernel. Recovery requires reboot. |
+| **Security** | Runs with limited capabilities (`CAP_SYS_RAWIO`, `CAP_SYS_TIME`). Attack surface is a userspace binary. | Runs in ring 0. A vulnerability is a kernel exploit. |
+| **Debuggability** | Standard tools: strace, gdb, journald | Requires printk, ftrace, kgdb |
+| **Configurability** | Easy to change poll rate, add monitoring, hot-plug logic | Requires module reload or sysfs knobs |
+| **Ecosystem reuse** | `phc2sys` is battle-tested, maintained by linuxptp | Custom sync loop — we own all the code and bugs |
+
+**Conclusion:** Userspace is the right default. The kernel/userspace boundary cost (~100 µs worst case) is negligible compared to firmware-based `get_tsf` latency (10-500 µs on ath10k, mt76). The data flow diagrams above show that the same PCIe transactions happen regardless of where the loop runs — the boundary crossing is a rounding error on the total cycle time.
+
+If a future deployment needs sub-µs precision and uses register-based drivers (ath9k, rtw88), moving the loop in-kernel is a straightforward optimization — the kernel module's `tsf_ptp_adjtime()` is already the in-kernel sync primitive; it just needs a kernel timer to call it instead of `phc2sys`.
+
+---
+
 ## How It Works
 
-Intel's `iwlwifi` driver already exposes its WiFi TSF as a PTP hardware clock. Our job is to extend this pattern to every other WiFi driver — about 20 Linux SoftMAC drivers gain PTP support through a single kernel module.
+Our kernel module (`tsf-ptp`) bridges the PTP clock API to mac80211's `get_tsf`/`set_tsf` for every SoftMAC WiFi driver (~20 drivers gain PTP support). Intel NICs have this [built into `iwlwifi`](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/intel/iwlwifi/mvm/ptp.c) natively. Once every WiFi card is a PTP clock, synchronization reduces to reading and writing TSF values through a standard kernel interface.
+
+### Single host
+
+One NIC is the timing master. `phc2sys` reads its TSF at 10 Hz, reads each secondary's TSF, computes the offset, and corrects via `set_tsf`:
 
 ```
- ┌─────────────────────────────────────────────────────────────────┐
- │                      PTP Domain                                 │
- │                                                                 │
- │   Upstream PTP         ┌──────────┐        Upstream PTP         │
- │   Grandmaster ────────►│  ptp4l   │◄─────── Grandmaster         │
- │   (GPS, atomic,        │          │         (or another host)   │
- │    or NIC PHC)         └────┬─────┘                             │
- │                             │                                   │
- │               ┌─────────────┼─────────────┐                     │
- │               │             │             │                     │
- │          /dev/ptp0     /dev/ptp1     /dev/ptpN                  │
- │          (Intel)       (MediaTek)   (any card)                  │
- │          iwlwifi       tsf-ptp      tsf-ptp                     │
- │          native        module       module                      │
- │               │             │             │                     │
- │           ┌───┴───┐    ┌────┴────┐   ┌────┴────┐               │
- │           │phy0   │    │phy1     │   │phyN     │               │
- │           │AX210  │    │MT7925   │   │any card │               │
- │           └───────┘    └─────────┘   └─────────┘               │
- └─────────────────────────────────────────────────────────────────┘
+                         ┌─────────────┐
+          read TSF       │   phc2sys   │     read TSF + correct
+       ┌────────────────►│   (10 Hz)   │◄──────────────────────┐
+       │                 └──────┬──────┘                       │
+       │                read + │ correct                       │
+       │                       │                               │
+  ┌────┴─────┐          ┌──────┴──────┐                 ┌──────┴──────┐
+  │  NIC 0   │          │   NIC 1     │                 │   NIC N     │
+  │ /dev/ptp0│          │  /dev/ptp1  │       ...       │  /dev/ptpN  │
+  │  MASTER  │          │  SECONDARY  │                 │  SECONDARY  │
+  │  (AX210) │          │  (MT7925)   │                 │  (any card) │
+  └──────────┘          └─────────────┘                 └─────────────┘
 
- Single host: ptp4l syncs all /dev/ptpN clocks to one primary.
- Multi-host:  ptp4l syncs across hosts over Ethernet — same protocol, same config.
+  For each secondary every 100 ms:
+    1. Read master TSF        (1 PCIe read)
+    2. Read secondary TSF     (1 PCIe read)
+    3. offset = master - secondary
+    4. If |offset| > threshold: set_tsf on secondary (1 read + 1 write)
+       Else: skip — already converged, no PCIe write
 ```
+
+### Multi-host: all NICs across all hosts in sync
+
+For multiple hosts, `ptp4l` runs on each host and communicates over Ethernet using the IEEE 1588 PTP protocol. One clock is elected grandmaster via PTP's Best Master Clock Algorithm — this can be a WiFi NIC, an Ethernet NIC with hardware timestamping, or an external source (GPS, atomic clock). Each host then independently syncs its local WiFi NICs using the same `phc2sys` loop:
+
+```
+                        ┌─────────────────┐
+                        │ PTP Grandmaster  │
+                        │ (Host A NIC 0,   │
+                        │  GPS receiver,   │
+                        │  or Ethernet PHC)│
+                        └────────┬────────┘
+                                 │
+                     PTP over Ethernet (IEEE 1588)
+                                 │
+              ┌──────────────────┼──────────────────┐
+              │                  │                  │
+     ┌────────┴────────┐        │         ┌────────┴────────┐
+     │     Host A      │        │         │     Host B      │
+     │                 │        │         │                 │
+     │  ptp4l ◄────────┼────────┼─────────┼───────► ptp4l  │
+     │    │            │                  │            │    │
+     │  phc2sys        │                  │         phc2sys │
+     │    │            │                  │            │    │
+     │  ┌─┴──┬────┐   │                  │   ┌────┬──┴─┐  │
+     │  │    │    │   │                  │   │    │    │  │
+     │ NIC0 NIC1 NIC2 │                  │ NIC0 NIC1 NIC2│
+     │  GM  SEC  SEC  │                  │ SEC  SEC  SEC  │
+     └────────────────┘                  └────────────────┘
+```
+
+The synchronization hierarchy:
+
+1. **`ptp4l`** on each host syncs one local PTP clock to the grandmaster over Ethernet
+2. **`phc2sys`** on each host syncs all local WiFi NICs to that host's primary clock
+3. **Result:** every WiFi NIC on every host converges to the same TSF
+
+No code changes from single-host to multi-host — just a `ptp4l` configuration change to add the Ethernet interface as a PTP transport. See [PTP Topology & Scaling](docs/ptp-topology.md) for configuration details.
 
 ### What we build
 
@@ -77,9 +264,9 @@ Intel's `iwlwifi` driver already exposes its WiFi TSF as a PTP hardware clock. O
 | **`phc2sys`** | Synchronizes system clock to a PTP hardware clock. |
 | **`ts2phc`** | Synchronizes PTP clocks to external time sources (GPS, 1PPS). |
 
-### Why PTP?
+### Why reuse the PTP ecosystem?
 
-We write ~500 lines of kernel C + ~2000 lines of Rust. We get single-host sync, multi-host sync, GPS/atomic clock input, system clock integration, sub-µs accuracy, and standard monitoring — all from the existing PTP ecosystem. See [Architecture & Design Rationale](docs/architecture.md) for the full evaluation of alternatives.
+We write ~500 lines of kernel C + ~2000 lines of Rust. We get single-host sync, multi-host sync, GPS/atomic clock input, system clock integration, sub-µs accuracy, and standard monitoring — all by leveraging existing PTP infrastructure rather than building a custom sync protocol. See [Architecture & Design Rationale](docs/architecture.md) for the full evaluation of alternatives.
 
 ---
 
@@ -180,7 +367,7 @@ tsf-sync/
 | Document | Description | Status |
 |----------|-------------|--------|
 | **[Project Status](docs/status.md)** | **Current phase, completed work, next steps, risks** | **Living document** |
-| [Architecture & Design Rationale](docs/architecture.md) | Core insight, why PTP, what we build vs upstream | Complete |
+| [Architecture & Design Rationale](docs/architecture.md) | Core insight, PTP as transport, what we build vs upstream | Complete |
 | [Driver Compatibility Survey](docs/driver-survey.md) | TSF/PTP support across all Linux WiFi drivers | Complete |
 | [Kernel Module: tsf-ptp](docs/kernel-module.md) | Module design, PTP↔mac80211 mapping, challenges | Complete |
 | [Userspace Tool: tsf-sync](docs/userspace-tool.md) | CLI, daemon mode, discovery, config generation | Complete |
