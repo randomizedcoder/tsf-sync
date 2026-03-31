@@ -13,7 +13,11 @@ pkgs.mkShell {
     iw
     ethtool
     kmod           # modprobe, insmod, rmmod
+    gnumake        # kernel module build
   ];
+
+  # Kernel headers for building tsf-ptp module.
+  KDIR = "${pkgs.linuxPackages.kernel.dev}/lib/modules/${pkgs.linuxPackages.kernel.modDirVersion}/build";
 
   RUST_BACKTRACE = "1";
 }

@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use tsf_sync::config_gen;
 use tsf_sync::daemon;
 use tsf_sync::discovery;
+use tsf_sync::sync_mode::SyncMode;
 
 #[derive(Parser, Debug)]
 #[command(name = "tsf-sync", about = "Bridge WiFi TSF into the Linux PTP subsystem")]
@@ -44,6 +45,19 @@ enum Command {
         /// Primary card phy name or "auto".
         #[arg(short, long, default_value = "auto")]
         primary: String,
+
+        /// Skip set_tsf if offset is below this threshold (nanoseconds).
+        /// 0 disables. Default 5000 (5µs). See docs/wifi-timing.md for tuning guidance.
+        #[arg(long, default_value = "5000")]
+        adjtime_threshold_ns: u64,
+
+        /// Sync mode: ptp (default), kernel, or iouring.
+        #[arg(long, default_value = "ptp", value_enum)]
+        sync_mode: SyncMode,
+
+        /// Kernel sync loop interval in ms (Mode B / kernel only).
+        #[arg(long, default_value = "10")]
+        sync_interval_ms: u32,
     },
 
     /// Show sync health for all cards.
@@ -61,6 +75,19 @@ enum Command {
         /// Health check interval.
         #[arg(short, long, default_value = "10s")]
         interval: String,
+
+        /// Skip set_tsf if offset is below this threshold (nanoseconds).
+        /// 0 disables. Default 5000 (5µs). See docs/wifi-timing.md for tuning guidance.
+        #[arg(long, default_value = "5000")]
+        adjtime_threshold_ns: u64,
+
+        /// Sync mode: ptp (default), kernel, or iouring.
+        #[arg(long, default_value = "ptp", value_enum)]
+        sync_mode: SyncMode,
+
+        /// Kernel sync loop interval in ms (Mode B / kernel only).
+        #[arg(long, default_value = "10")]
+        sync_interval_ms: u32,
     },
 }
 
@@ -110,9 +137,14 @@ fn run(command: Command, linuxptp_bin: &str) -> Result<(), Box<dyn std::error::E
             }
         }
 
-        Command::Start { primary } => {
-            let _processes = daemon::start(&primary, linuxptp_bin)?;
-            tracing::info!("tsf-sync started. Press Ctrl-C to stop.");
+        Command::Start { primary, adjtime_threshold_ns, sync_mode, sync_interval_ms } => {
+            #[cfg(not(feature = "iouring"))]
+            if matches!(sync_mode, SyncMode::Iouring) {
+                return Err("iouring sync mode requires --features iouring".into());
+            }
+
+            let _state = daemon::start(&primary, linuxptp_bin, adjtime_threshold_ns, sync_mode, sync_interval_ms)?;
+            tracing::info!("tsf-sync started (mode: {}). Press Ctrl-C to stop.", sync_mode);
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
             }
@@ -123,13 +155,18 @@ fn run(command: Command, linuxptp_bin: &str) -> Result<(), Box<dyn std::error::E
         }
 
         Command::Stop => {
-            daemon::stop(&mut Vec::new())?;
+            daemon::stop(&mut daemon::SyncState::Phc2sys(Vec::new()))?;
         }
 
-        Command::Daemon { primary, interval } => {
+        Command::Daemon { primary, interval, adjtime_threshold_ns, sync_mode, sync_interval_ms } => {
+            #[cfg(not(feature = "iouring"))]
+            if matches!(sync_mode, SyncMode::Iouring) {
+                return Err("iouring sync mode requires --features iouring".into());
+            }
+
             let interval = daemon::parse_interval(&interval)
                 .map_err(|e| format!("invalid interval: {}", e))?;
-            daemon::run_daemon(&primary, interval, linuxptp_bin)?;
+            daemon::run_daemon(&primary, interval, linuxptp_bin, adjtime_threshold_ns, sync_mode, sync_interval_ms)?;
         }
     }
 

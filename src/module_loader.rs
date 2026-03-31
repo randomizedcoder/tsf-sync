@@ -42,9 +42,10 @@ pub fn is_tsf_ptp_loaded() -> Result<bool, ModuleError> {
 }
 
 /// Load a kernel module via modprobe.
-pub fn load_module(module: &str) -> Result<(), ModuleError> {
+pub fn load_module(module: &str, params: &[&str]) -> Result<(), ModuleError> {
     let output = Command::new("modprobe")
         .arg(module)
+        .args(params)
         .output()
         .map_err(ModuleError::Exec)?;
 
@@ -58,9 +59,10 @@ pub fn load_module(module: &str) -> Result<(), ModuleError> {
 }
 
 /// Load a kernel module via insmod (for out-of-tree modules).
-pub fn insmod(path: &str) -> Result<(), ModuleError> {
+pub fn insmod(path: &str, params: &[&str]) -> Result<(), ModuleError> {
     let output = Command::new("insmod")
         .arg(path)
+        .args(params)
         .output()
         .map_err(ModuleError::Exec)?;
 
@@ -75,14 +77,41 @@ pub fn insmod(path: &str) -> Result<(), ModuleError> {
 
 /// Load the tsf-ptp module. Tries modprobe first, falls back to insmod
 /// from the known build location.
-pub fn load_tsf_ptp() -> Result<(), ModuleError> {
+///
+/// `sync_mode` selects the kernel's sync strategy:
+///   0 = PTP (default, phc2sys), 1 = kernel loop, 2 = chardev.
+/// `sync_primary` optionally names the primary phy (e.g. "phy0").
+/// `sync_interval_ms` sets the kernel sync loop period (Mode B only).
+pub fn load_tsf_ptp(
+    adjtime_threshold_ns: u64,
+    sync_mode: crate::sync_mode::SyncMode,
+    sync_primary: Option<&str>,
+    sync_interval_ms: Option<u32>,
+) -> Result<(), ModuleError> {
     if is_tsf_ptp_loaded()? {
         tracing::info!("tsf-ptp module already loaded");
         return Ok(());
     }
 
+    let mut param_strings = vec![
+        format!("adjtime_threshold_ns={}", adjtime_threshold_ns),
+        format!("sync_mode={}", sync_mode.as_kernel_param()),
+    ];
+
+    if let Some(primary) = sync_primary {
+        if !primary.is_empty() && primary != "auto" {
+            param_strings.push(format!("sync_primary={}", primary));
+        }
+    }
+
+    if let Some(interval) = sync_interval_ms {
+        param_strings.push(format!("sync_interval_ms={}", interval));
+    }
+
+    let params: Vec<&str> = param_strings.iter().map(|s| s.as_str()).collect();
+
     // Try modprobe first (works if installed via DKMS/modules_install).
-    match load_module(MODULE_NAME) {
+    match load_module(MODULE_NAME, &params) {
         Ok(()) => return Ok(()),
         Err(e) => tracing::debug!("modprobe failed, will try insmod: {}", e),
     }
@@ -90,7 +119,7 @@ pub fn load_tsf_ptp() -> Result<(), ModuleError> {
     // Try insmod from project directory.
     let module_path = "kernel/tsf_ptp.ko";
     if std::path::Path::new(module_path).exists() {
-        insmod(module_path)
+        insmod(module_path, &params)
     } else {
         Err(ModuleError::Modprobe(format!(
             "tsf_ptp module not found via modprobe or at {}",

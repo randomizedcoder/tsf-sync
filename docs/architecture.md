@@ -1,5 +1,11 @@
 # Architecture & Design Rationale
 
+## Use Case: Coordinated WiFi APs
+
+tsf-sync targets deployments where a single Linux host runs multiple WiFi NICs in AP mode. Synchronizing their TSF clocks enables seamless client roaming, coordinated contention windows, and reduced inter-AP interference in the shared RF environment. See [WiFi Timing Requirements](wifi-timing.md) for detailed analysis of 802.11 timing constraints and the ≤10 µs accuracy target.
+
+---
+
 ## Core Insight
 
 Intel's `iwlwifi` driver already exposes its WiFi TSF as a PTP hardware clock (`/dev/ptpN`). This means `ptp4l` can already synchronize Intel WiFi cards using standard IEEE 1588 — no custom code needed.
@@ -9,6 +15,22 @@ Intel's `iwlwifi` driver already exposes its WiFi TSF as a PTP hardware clock (`
 For cards that have `get_tsf`/`set_tsf` through mac80211 (MediaTek, Qualcomm, Realtek, Broadcom, TI — about 20 drivers), we write a kernel module that wraps those ops as a `ptp_clock_info`, registering a `/dev/ptpN` for each card.
 
 Once every WiFi card is a PTP clock, the entire problem reduces to standard PTP clock synchronization — a solved problem with decades of engineering behind it.
+
+---
+
+## PTP as Transport, Not Wall-Clock
+
+Traditional PTP synchronizes wall-clock time (UTC/TAI) across network devices. We use the PTP kernel API for a fundamentally different purpose: synchronizing BSS phase (WiFi TSF counters) between co-located radios on the same host. There is no wall clock involved.
+
+The key design decisions that make this work:
+
+- **`-O 0` (no UTC/TAI offset).** `phc2sys` normally applies a UTC-TAI offset when disciplining clocks. We pass `-O 0` because both source and destination are raw TSF values in the same counter domain — there is no wall-clock conversion to perform. This makes `phc2sys` operate as a pure TSF-to-TSF offset corrector.
+
+- **`adjfine` returns 0 (no-op).** WiFi cards have fixed-frequency oscillators — there is no hardware knob to tune the clock rate. When `phc2sys` calls `adjfine` to apply frequency correction, our module accepts the call silently (returning 0) but does nothing. This means PTP cannot run as a PLL (phase-locked loop); all correction happens via time-stepping through `adjtime`.
+
+- **`adjtime` is read-modify-write.** No WiFi driver implements `offset_tsf` (add a delta). Our `tsf_ptp_adjtime()` reads the current TSF, adds the offset, and writes the result back via `set_tsf`. A threshold filter skips the write when the offset is small enough, avoiding unnecessary PCIe transactions in steady state.
+
+The result is that `phc2sys` operates purely as a **polling-based offset corrector**: sample the primary, sample each secondary, compute the difference, step-correct if above threshold. PTP's clock discipline algorithms (PI controller, frequency estimation) are present but have no effect — frequency adjustment is a no-op, and all correction is time-stepping.
 
 ---
 
@@ -32,9 +54,9 @@ Once every WiFi card is a PTP clock, the entire problem reduces to standard PTP 
 
 ---
 
-## Why PTP Wins
+## Why Reuse the PTP Ecosystem
 
-We evaluated several alternative architectures. The comparison:
+We evaluated several alternative architectures. PTP is the vehicle for delivering TSF sync, not the end goal — the question is whether reusing PTP infrastructure beats building a custom sync protocol. The comparison:
 
 | Approach | Intra-host sync | Multi-host sync | Maintenance burden | Accuracy |
 |----------|----------------|----------------|-------------------|----------|
@@ -43,7 +65,7 @@ We evaluated several alternative architectures. The comparison:
 | Custom daemon + channels | Thread-per-card, crossbeam channels | Custom protocol needed | Full sync protocol + per-card threads | ~1ms |
 | Async daemon (tokio) | spawn_blocking (all ops block) | Custom protocol needed | Async complexity for zero benefit | ~1ms |
 
-**The PTP approach wins decisively:**
+**Reusing the PTP ecosystem wins decisively:**
 
 1. **We write less code.** ~500 lines of kernel C + ~2000 lines of Rust orchestration vs ~5000+ lines of custom sync daemon.
 2. **We maintain less code.** We don't implement: clock discipline algorithms, frequency estimation, delay measurement, best-master-clock election, multi-host messaging, or any synchronization protocol.
@@ -59,6 +81,45 @@ We evaluated several alternative architectures. The comparison:
 - **`ptp4l` is an external dependency.** But it's packaged everywhere and trivial to deploy.
 
 For the full list of alternatives considered, see [Options Considered](options-considered.md).
+
+---
+
+## Sync Modes
+
+The sync loop can run in three different configurations, offering a spectrum from maximum ecosystem reuse to minimum latency. All modes share the same kernel module for PTP clock registration and TSF access — they differ only in where the read → compare → correct loop executes.
+
+### Mode A: PTP + phc2sys (default)
+
+`phc2sys` runs in userspace at 10 Hz, polling both clocks via `clock_gettime`/`clock_adjtime` ioctls. The kernel module translates PTP ops to TSF reads/writes. This is the simplest mode — `phc2sys` is battle-tested, easy to debug with standard tools (strace, journald), and restartable via systemd without kernel interaction.
+
+**Overhead:** 2 syscalls per card per cycle (gettime + adjtime). Scheduling jitter ~10-100 µs. Negligible compared to firmware-based `get_tsf` latency (10-500 µs).
+
+### Mode B: Kernel sync loop
+
+A `delayed_work` timer in the kernel module calls `get_tsf`/`set_tsf` directly — no context switch, no userspace scheduling jitter. The Rust daemon monitors via sysfs counters (`sync_count`, `sync_error_count`, per-card `last_offset_ns`).
+
+We use `delayed_work` (not `hrtimer`) because TSF ops call `might_sleep()` — they acquire mutexes and `wiphy_lock`. `delayed_work` runs in process context via kworker, which is the same pattern used by in-tree PTP drivers (`ice`, `igb`).
+
+**When to use:** Sub-µs targets with register-based drivers (ath9k, rtw88) where context-switch jitter dominates.
+
+**Lock ordering:** `cards_lock` → `card->lock` → `wiphy_lock` (matches existing convention).
+
+### Mode C: io_uring + char device
+
+A `/dev/tsf_sync` misc device supports batch read/write: one `read()` returns all card TSF snapshots, one `write()` applies all adjustments. The Rust daemon uses `io_uring` to submit these as async I/O, reducing per-cycle syscalls from 2N+2 (phc2sys) to 2.
+
+**When to use:** Many cards (50-100+) where per-card syscall overhead matters, but you want the algorithm in debuggable userspace. Requires `--features iouring` at build time.
+
+### Tradeoff summary
+
+| Aspect | Mode A (phc2sys) | Mode B (kernel) | Mode C (io_uring) |
+|--------|-----------------|-----------------|-------------------|
+| Latency | ~10-100 µs jitter | Sub-µs | ~1-10 µs |
+| Fault isolation | Userspace crash, systemd restart | Kernel bug = reboot | Userspace crash, restartable |
+| Debuggability | strace, gdb, journald | printk, ftrace | strace, gdb + reduced syscalls |
+| Syscalls/cycle | 2N+2 | 0 (kernel-internal) | 2 (batch read + write) |
+| Algorithm | phc2sys PI controller | Simple offset + step | Custom Rust (same as kernel) |
+| Dependencies | linuxptp | None (kernel only) | `io-uring` crate |
 
 ---
 

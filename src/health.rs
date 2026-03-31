@@ -152,6 +152,35 @@ pub fn format_status_table(statuses: &[ClockStatus]) -> String {
     out
 }
 
+/// Status from kernel sync loop (Mode B) and chardev (Mode C), read from sysfs.
+#[derive(Debug, Clone)]
+pub struct KernelSyncStatus {
+    pub sync_count: i64,
+    pub sync_error_count: i64,
+    pub adjtime_skip_count: i64,
+    pub adjtime_apply_count: i64,
+}
+
+/// Read kernel sync health from sysfs module parameters.
+pub fn query_kernel_sync_health() -> Result<KernelSyncStatus, HealthError> {
+    let read_param = |name: &str| -> Result<i64, HealthError> {
+        std::fs::read_to_string(format!("/sys/module/tsf_ptp/parameters/{}", name))
+            .map_err(HealthError::PmcExec)
+            .and_then(|s| {
+                s.trim()
+                    .parse()
+                    .map_err(|e| HealthError::Parse(format!("{}: {}", name, e)))
+            })
+    };
+
+    Ok(KernelSyncStatus {
+        sync_count: read_param("sync_count")?,
+        sync_error_count: read_param("sync_error_count")?,
+        adjtime_skip_count: read_param("adjtime_skip_count")?,
+        adjtime_apply_count: read_param("adjtime_apply_count")?,
+    })
+}
+
 /// Determine health from a clock offset value.
 pub fn classify_offset(offset_ns: i64) -> HealthState {
     if offset_ns.abs() < HEALTHY_THRESHOLD_NS {

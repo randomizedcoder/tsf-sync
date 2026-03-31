@@ -14,7 +14,8 @@ KSRC := $(shell if [ -d "$(KDIR)/../source/net/mac80211" ]; then \
 	echo "$(KDIR)"; \
 	else echo "$(KDIR)"; fi)
 
-ccflags-y += -I$(KSRC)/net/mac80211
+# Explicitly require GNU C11 (kernel default since 5.18, but be explicit).
+ccflags-y += -std=gnu11 -I$(KSRC)/net/mac80211
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
