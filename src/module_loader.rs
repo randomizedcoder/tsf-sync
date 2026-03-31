@@ -77,14 +77,38 @@ pub fn insmod(path: &str, params: &[&str]) -> Result<(), ModuleError> {
 
 /// Load the tsf-ptp module. Tries modprobe first, falls back to insmod
 /// from the known build location.
-pub fn load_tsf_ptp(adjtime_threshold_ns: u64) -> Result<(), ModuleError> {
+///
+/// `sync_mode` selects the kernel's sync strategy:
+///   0 = PTP (default, phc2sys), 1 = kernel loop, 2 = chardev.
+/// `sync_primary` optionally names the primary phy (e.g. "phy0").
+/// `sync_interval_ms` sets the kernel sync loop period (Mode B only).
+pub fn load_tsf_ptp(
+    adjtime_threshold_ns: u64,
+    sync_mode: crate::sync_mode::SyncMode,
+    sync_primary: Option<&str>,
+    sync_interval_ms: Option<u32>,
+) -> Result<(), ModuleError> {
     if is_tsf_ptp_loaded()? {
         tracing::info!("tsf-ptp module already loaded");
         return Ok(());
     }
 
-    let threshold_param = format!("adjtime_threshold_ns={}", adjtime_threshold_ns);
-    let params = [threshold_param.as_str()];
+    let mut param_strings = vec![
+        format!("adjtime_threshold_ns={}", adjtime_threshold_ns),
+        format!("sync_mode={}", sync_mode.as_kernel_param()),
+    ];
+
+    if let Some(primary) = sync_primary {
+        if !primary.is_empty() && primary != "auto" {
+            param_strings.push(format!("sync_primary={}", primary));
+        }
+    }
+
+    if let Some(interval) = sync_interval_ms {
+        param_strings.push(format!("sync_interval_ms={}", interval));
+    }
+
+    let params: Vec<&str> = param_strings.iter().map(|s| s.as_str()).collect();
 
     // Try modprobe first (works if installed via DKMS/modules_install).
     match load_module(MODULE_NAME, &params) {

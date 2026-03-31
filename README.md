@@ -24,11 +24,17 @@ sudo nix run .#test-hwsim
 # Run sync and monitor counters for 30 seconds
 sudo nix run .#test-sync
 
+# MicroVM lifecycle test — boots a VM with hwsim + tsf_ptp, no root needed
+nix run .#tsf-sync-lifecycle-test-basic
+
+# Cross-compile for aarch64
+nix build .#tsf-sync-aarch64-linux
+
 # CI checks (fmt + clippy + test + build)
 nix flake check
 ```
 
-See [Nix Reference](docs/nix.md) for all flake outputs, NixOS module configuration, and test scripts.
+See [Nix Reference](docs/nix.md) for all flake outputs, cross-compilation, MicroVM testing, NixOS module, and lifecycle tests.
 
 ---
 
@@ -181,6 +187,37 @@ If a future deployment needs sub-µs precision and uses register-based drivers (
 
 ---
 
+## Sync Modes
+
+Three sync modes offer different points on the simplicity/performance tradeoff. All modes use the same kernel module (`tsf-ptp`) for PTP clock registration and TSF access — they differ only in where the read → compare → correct loop runs.
+
+| Mode | Flag | Kernel | Userspace | When to use |
+|------|------|--------|-----------|-------------|
+| **PTP + phc2sys** (default) | `--sync-mode ptp` | PTP clocks only | Spawns `phc2sys` | Default. Maximum ecosystem reuse, easiest debugging |
+| **Kernel sync loop** | `--sync-mode kernel` | PTP clocks + `delayed_work` timer | Monitor only (sysfs) | Lowest latency. No context switch. For sub-µs targets with register-based drivers |
+| **io_uring** | `--sync-mode iouring` | PTP clocks + `/dev/tsf_sync` char device | `io-uring` crate, batch read/write | Middle ground. Userspace algorithm with reduced syscall overhead |
+
+### Usage examples
+
+```bash
+# Mode A: PTP + phc2sys (default, no flag needed)
+sudo tsf-sync start
+sudo tsf-sync daemon --interval 10s
+
+# Mode B: kernel sync loop (all sync runs in kworker, monitor via sysfs)
+sudo tsf-sync start --sync-mode kernel --sync-interval-ms 10
+cat /sys/module/tsf_ptp/parameters/sync_count       # completed cycles
+cat /sys/module/tsf_ptp/parameters/sync_error_count  # errors
+
+# Mode C: io_uring (requires --features iouring at build time)
+cargo build --features iouring
+sudo tsf-sync start --sync-mode iouring --sync-interval-ms 10
+```
+
+Mode B is the right choice when targeting sub-µs precision with register-based drivers (ath9k, rtw88) — it eliminates context-switch jitter entirely. Mode C keeps the algorithm in debuggable userspace while cutting per-cycle syscalls from 2N+2 (phc2sys) to 2 (one read, one write). Mode A remains the default because `phc2sys` is battle-tested and the context-switch overhead is negligible relative to firmware-based `get_tsf` latency.
+
+---
+
 ## How It Works
 
 Our kernel module (`tsf-ptp`) bridges the PTP clock API to mac80211's `get_tsf`/`set_tsf` for every SoftMAC WiFi driver (~20 drivers gain PTP support). Intel NICs have this [built into `iwlwifi`](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/intel/iwlwifi/mvm/ptp.c) natively. Once every WiFi card is a PTP clock, synchronization reduces to reading and writing TSF values through a standard kernel interface.
@@ -300,8 +337,9 @@ tsf-sync/
 │   └── options-considered.md          # Alternatives evaluated & rejected
 │
 ├── kernel/                            # tsf-ptp kernel module
-│   ├── tsf_ptp.c                      # PTP clock registration, mac80211 bridge
-│   ├── tsf_ptp.h                      # Internal header
+│   ├── tsf_ptp.c                      # PTP clock ops, kernel sync loop, char device
+│   ├── tsf_ptp.h                      # Internal header (per-card state, sync mode enum)
+│   ├── tsf_ptp_uapi.h                # UAPI structs shared with userspace (Mode C)
 │   ├── Makefile                       # Kbuild makefile
 │   ├── dkms.conf                      # DKMS for non-NixOS
 │   └── tests/
@@ -311,11 +349,13 @@ tsf-sync/
 ├── src/                               # Rust userspace tool
 │   ├── main.rs                        # CLI entry (discover, config, start, status, stop)
 │   ├── lib.rs                         # Re-exports
+│   ├── sync_mode.rs                   # SyncMode enum, UAPI struct definitions
 │   ├── discovery.rs                   # Sysfs scanning, driver identification
 │   ├── config_gen.rs                  # ptp4l.conf generation
-│   ├── daemon.rs                      # Daemon mode, lifecycle, hot-plug
-│   ├── health.rs                      # Health monitoring via pmc
+│   ├── daemon.rs                      # Daemon mode, SyncState lifecycle, monitoring
+│   ├── health.rs                      # Health monitoring via pmc + sysfs
 │   ├── ptp4l.rs                       # ptp4l process management
+│   ├── iouring_sync.rs               # io_uring sync loop (Mode C, feature-gated)
 │   └── module_loader.rs               # Kernel module loading/unloading
 │
 ├── tests/                             # Rust tests
@@ -324,13 +364,19 @@ tsf-sync/
 │   └── integration/
 │       └── hwsim_test.rs              # Full stack with mac80211_hwsim
 │
-├── nix/                               # NixOS packaging
+├── nix/                               # NixOS packaging & testing
 │   ├── package.nix                    # Crane-based Rust build
 │   ├── kernel-module.nix              # Kernel module build
+│   ├── cross.nix                      # Cross-compilation (aarch64, riscv64)
 │   ├── devshell.nix                   # Development shell (Rust + kernel headers)
 │   ├── ci.nix                         # CI checks (fmt, clippy, test, build)
 │   ├── module.nix                     # NixOS service module (systemd)
-│   └── scripts.nix                    # Test/build helper scripts
+│   ├── scripts.nix                    # Test/build helper scripts
+│   ├── overlays/                      # Nixpkgs overlays for cross builds
+│   └── tests/microvm/                 # MicroVM lifecycle testing
+│       ├── constants.nix              # Arch defs, ports, timeouts, variants
+│       ├── microvm.nix                # VM generator (hwsim + tsf_ptp)
+│       └── lifecycle/                 # Phased test scripts (boot → verify → shutdown)
 │
 ├── flake.nix
 ├── Cargo.toml

@@ -2,5 +2,8 @@ pub mod config_gen;
 pub mod daemon;
 pub mod discovery;
 pub mod health;
+#[cfg(feature = "iouring")]
+pub mod iouring_sync;
 pub mod module_loader;
 pub mod ptp4l;
+pub mod sync_mode;

@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -8,6 +10,7 @@ use crate::discovery;
 use crate::health;
 use crate::module_loader;
 use crate::ptp4l;
+use crate::sync_mode::SyncMode;
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -26,10 +29,30 @@ pub enum DaemonError {
 const SYSFS_IEEE80211: &str = "/sys/class/ieee80211";
 const DEFAULT_UDS_PATH: &str = "/var/run/ptp4l";
 
-/// Start the full tsf-sync stack: discover → load module → spawn phc2sys.
+/// Active sync state — varies by mode.
+pub enum SyncState {
+    /// Mode A: phc2sys processes (one per secondary clock).
+    Phc2sys(Vec<ptp4l::SyncProcess>),
+    /// Mode B: kernel handles sync loop via delayed_work. Nothing to manage.
+    Kernel,
+    /// Mode C: io_uring sync thread.
+    #[cfg(feature = "iouring")]
+    IoUring {
+        handle: std::thread::JoinHandle<()>,
+        running: Arc<AtomicBool>,
+    },
+}
+
+/// Start the full tsf-sync stack: discover → load module → start sync.
 ///
-/// Returns a list of phc2sys processes (one per secondary clock).
-pub fn start(primary: &str, linuxptp_bin: &str, adjtime_threshold_ns: u64) -> Result<Vec<ptp4l::SyncProcess>, DaemonError> {
+/// Returns a `SyncState` representing the active sync mechanism.
+pub fn start(
+    primary: &str,
+    linuxptp_bin: &str,
+    adjtime_threshold_ns: u64,
+    sync_mode: SyncMode,
+    sync_interval_ms: u32,
+) -> Result<SyncState, DaemonError> {
     // 1. Initial discovery.
     let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211))?;
     tracing::info!(count = cards.len(), "discovered WiFi cards");
@@ -39,9 +62,16 @@ pub fn start(primary: &str, linuxptp_bin: &str, adjtime_threshold_ns: u64) -> Re
         c.can_set_tsf && c.ptp_clock.is_none() && c.ptp_source == discovery::PtpSource::None
     });
 
+    let primary_for_module = if primary != "auto" { Some(primary) } else { None };
+
     if needs_module {
-        tracing::info!("loading tsf-ptp kernel module");
-        module_loader::load_tsf_ptp(adjtime_threshold_ns)?;
+        tracing::info!("loading tsf-ptp kernel module (mode: {})", sync_mode);
+        module_loader::load_tsf_ptp(
+            adjtime_threshold_ns,
+            sync_mode,
+            primary_for_module,
+            Some(sync_interval_ms),
+        )?;
         std::thread::sleep(Duration::from_millis(500));
     }
 
@@ -61,43 +91,93 @@ pub fn start(primary: &str, linuxptp_bin: &str, adjtime_threshold_ns: u64) -> Re
     tracing::info!(
         primary = %primary_card.phy,
         clock = %primary_clock.display(),
+        mode = %sync_mode,
         "selected primary clock"
     );
 
-    // 4. Start phc2sys for each secondary.
-    let phc2sys_bin = ptp4l::phc2sys_bin_from(linuxptp_bin);
-    let phc2sys_str = phc2sys_bin.to_string_lossy();
-    let mut processes = Vec::new();
+    match sync_mode {
+        SyncMode::Ptp => {
+            // Mode A: start phc2sys for each secondary.
+            let phc2sys_bin = ptp4l::phc2sys_bin_from(linuxptp_bin);
+            let phc2sys_str = phc2sys_bin.to_string_lossy();
+            let mut processes = Vec::new();
 
-    for card in &ptp_cards {
-        if card.phy == primary_card.phy {
-            continue;
+            for card in &ptp_cards {
+                if card.phy == primary_card.phy {
+                    continue;
+                }
+                let secondary_clock = card.ptp_clock.as_ref().unwrap();
+                tracing::info!(
+                    secondary = %card.phy,
+                    clock = %secondary_clock.display(),
+                    "syncing to primary"
+                );
+
+                let proc = ptp4l::start_phc2sys(primary_clock, secondary_clock, &phc2sys_str)?;
+                processes.push(proc);
+            }
+
+            tracing::info!(count = processes.len(), "started phc2sys processes");
+            Ok(SyncState::Phc2sys(processes))
         }
-        let secondary_clock = card.ptp_clock.as_ref().unwrap();
-        tracing::info!(
-            secondary = %card.phy,
-            clock = %secondary_clock.display(),
-            "syncing to primary"
-        );
 
-        let proc = ptp4l::start_phc2sys(primary_clock, secondary_clock, &phc2sys_str)?;
-        processes.push(proc);
+        SyncMode::Kernel => {
+            // Mode B: kernel handles everything via delayed_work.
+            tracing::info!("kernel sync loop active (check sysfs for status)");
+            Ok(SyncState::Kernel)
+        }
+
+        #[cfg(feature = "iouring")]
+        SyncMode::Iouring => {
+            // Mode C: spawn io_uring sync thread.
+            let primary_index = crate::iouring_sync::find_primary_index(&primary_card.phy)?;
+            let running = Arc::new(AtomicBool::new(true));
+            let r = running.clone();
+
+            let threshold = adjtime_threshold_ns as i64;
+            let interval = Duration::from_millis(sync_interval_ms as u64);
+
+            let handle = std::thread::spawn(move || {
+                match crate::iouring_sync::IoUringSyncer::new(
+                    primary_index, threshold, interval,
+                ) {
+                    Ok(syncer) => syncer.run(r),
+                    Err(e) => tracing::error!("failed to create io_uring syncer: {}", e),
+                }
+            });
+
+            tracing::info!("io_uring sync thread started");
+            Ok(SyncState::IoUring { handle, running })
+        }
+
+        #[cfg(not(feature = "iouring"))]
+        SyncMode::Iouring => {
+            Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "iouring sync mode requires --features iouring",
+            )))
+        }
     }
-
-    tracing::info!(
-        count = processes.len(),
-        "started phc2sys processes for local clock sync"
-    );
-
-    Ok(processes)
 }
 
-/// Stop the tsf-sync stack: stop all sync processes → unload module.
-pub fn stop(processes: &mut Vec<ptp4l::SyncProcess>) -> Result<(), DaemonError> {
-    for p in processes.iter_mut() {
-        let _ = p.stop();
+/// Stop the tsf-sync stack: stop sync processes → unload module.
+pub fn stop(state: &mut SyncState) -> Result<(), DaemonError> {
+    match state {
+        SyncState::Phc2sys(processes) => {
+            for p in processes.iter_mut() {
+                let _ = p.stop();
+            }
+            processes.clear();
+        }
+        SyncState::Kernel => {
+            // Kernel sync stops when the module is unloaded.
+        }
+        #[cfg(feature = "iouring")]
+        SyncState::IoUring { running, .. } => {
+            running.store(false, Ordering::SeqCst);
+            // Thread will exit on next loop iteration.
+        }
     }
-    processes.clear();
 
     module_loader::unload_tsf_ptp()?;
     Ok(())
@@ -105,24 +185,56 @@ pub fn stop(processes: &mut Vec<ptp4l::SyncProcess>) -> Result<(), DaemonError> 
 
 /// Query and display health status.
 pub fn status() -> Result<(), DaemonError> {
-    match health::query_health(DEFAULT_UDS_PATH) {
-        Ok(statuses) => {
-            if statuses.is_empty() {
-                println!("No clock statuses reported. Is ptp4l running?");
-            } else {
-                print!("{}", health::format_status_table(&statuses));
+    // Check active sync mode from sysfs.
+    let active_mode = discovery::detect_active_sync_mode();
+
+    match active_mode {
+        Some(SyncMode::Kernel) | Some(SyncMode::Iouring) => {
+            // Modes B/C: show kernel sync stats from sysfs.
+            match health::query_kernel_sync_health() {
+                Ok(kstatus) => {
+                    println!("Sync mode: {}", active_mode.unwrap());
+                    println!("  sync_count:        {}", kstatus.sync_count);
+                    println!("  sync_error_count:  {}", kstatus.sync_error_count);
+                    println!("  adjtime_skip:      {}", kstatus.adjtime_skip_count);
+                    println!("  adjtime_apply:     {}", kstatus.adjtime_apply_count);
+                }
+                Err(e) => {
+                    println!("Could not read kernel sync status: {}", e);
+                }
             }
         }
-        Err(e) => {
-            tracing::warn!("health query failed: {}", e);
-            println!("Could not query ptp4l status: {}", e);
+        _ => {
+            // Mode A or unknown: use pmc.
+            match health::query_health(DEFAULT_UDS_PATH) {
+                Ok(statuses) => {
+                    if statuses.is_empty() {
+                        println!("No clock statuses reported. Is ptp4l running?");
+                    } else {
+                        print!("{}", health::format_status_table(&statuses));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("health query failed: {}", e);
+                    println!("Could not query ptp4l status: {}", e);
+                }
+            }
         }
     }
+
+    // Always show adjtime counters if available.
+    if let (Some(skip), Some(apply)) = (
+        read_sysfs_counter("adjtime_skip_count"),
+        read_sysfs_counter("adjtime_apply_count"),
+    ) {
+        println!("  adjtime: {} applied, {} skipped", apply, skip);
+    }
+
     Ok(())
 }
 
-/// Read an adjtime counter from sysfs.
-fn read_adjtime_counter(name: &str) -> Option<i64> {
+/// Read a sysfs parameter from the tsf_ptp module.
+fn read_sysfs_counter(name: &str) -> Option<i64> {
     std::fs::read_to_string(format!("/sys/module/tsf_ptp/parameters/{}", name))
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -134,10 +246,9 @@ pub fn run_daemon(
     interval: Duration,
     linuxptp_bin: &str,
     adjtime_threshold_ns: u64,
+    sync_mode: SyncMode,
+    sync_interval_ms: u32,
 ) -> Result<(), DaemonError> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
@@ -145,8 +256,8 @@ pub fn run_daemon(
         r.store(false, Ordering::SeqCst);
     });
 
-    let mut processes = start(primary, linuxptp_bin, adjtime_threshold_ns)?;
-    tracing::info!("daemon started, monitoring every {:?}", interval);
+    let mut state = start(primary, linuxptp_bin, adjtime_threshold_ns, sync_mode, sync_interval_ms)?;
+    tracing::info!("daemon started (mode: {}), monitoring every {:?}", sync_mode, interval);
 
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(interval);
@@ -155,18 +266,57 @@ pub fn run_daemon(
             break;
         }
 
-        // Check if any phc2sys processes crashed.
-        for proc in &mut processes {
-            if !proc.is_running() {
-                tracing::warn!("phc2sys process exited, will restart on next cycle");
-                // TODO: restart individual failed processes
+        // Mode-specific monitoring.
+        match &mut state {
+            SyncState::Phc2sys(processes) => {
+                // Check if any phc2sys processes crashed.
+                for proc in processes.iter_mut() {
+                    if !proc.is_running() {
+                        tracing::warn!("phc2sys process exited, will restart on next cycle");
+                    }
+                }
+
+                // Log health via pmc.
+                match health::query_health(DEFAULT_UDS_PATH) {
+                    Ok(statuses) => {
+                        for s in &statuses {
+                            tracing::info!(
+                                port = %s.port,
+                                state = %s.port_state,
+                                health = %s.health,
+                                "clock status"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("health check via pmc not available: {}", e);
+                    }
+                }
+            }
+
+            SyncState::Kernel => {
+                // Log kernel sync stats from sysfs.
+                if let Ok(kstatus) = health::query_kernel_sync_health() {
+                    tracing::info!(
+                        sync_count = kstatus.sync_count,
+                        errors = kstatus.sync_error_count,
+                        "kernel sync status"
+                    );
+                }
+            }
+
+            #[cfg(feature = "iouring")]
+            SyncState::IoUring { handle, .. } => {
+                if handle.is_finished() {
+                    tracing::warn!("io_uring sync thread exited unexpectedly");
+                }
             }
         }
 
-        // Log adjtime threshold counters.
+        // Log adjtime threshold counters (common to all modes).
         if let (Some(skip), Some(apply)) = (
-            read_adjtime_counter("adjtime_skip_count"),
-            read_adjtime_counter("adjtime_apply_count"),
+            read_sysfs_counter("adjtime_skip_count"),
+            read_sysfs_counter("adjtime_apply_count"),
         ) {
             tracing::info!(
                 skipped = skip,
@@ -174,27 +324,10 @@ pub fn run_daemon(
                 "adjtime threshold stats"
             );
         }
-
-        // Log health status.
-        match health::query_health(DEFAULT_UDS_PATH) {
-            Ok(statuses) => {
-                for s in &statuses {
-                    tracing::info!(
-                        port = %s.port,
-                        state = %s.port_state,
-                        health = %s.health,
-                        "clock status"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::debug!("health check via pmc not available: {}", e);
-            }
-        }
     }
 
     tracing::info!("shutting down");
-    stop(&mut processes)?;
+    stop(&mut state)?;
     Ok(())
 }
 

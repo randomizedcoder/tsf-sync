@@ -169,6 +169,20 @@ pub fn format_table(cards: &[WifiCard]) -> String {
     out
 }
 
+/// Detect the active sync mode by reading `/sys/module/tsf_ptp/parameters/sync_mode`.
+///
+/// Returns `None` if the module is not loaded or the parameter can't be read.
+pub fn detect_active_sync_mode() -> Option<crate::sync_mode::SyncMode> {
+    let value = std::fs::read_to_string("/sys/module/tsf_ptp/parameters/sync_mode")
+        .ok()?;
+    match value.trim() {
+        "0" => Some(crate::sync_mode::SyncMode::Ptp),
+        "1" => Some(crate::sync_mode::SyncMode::Kernel),
+        "2" => Some(crate::sync_mode::SyncMode::Iouring),
+        _ => None,
+    }
+}
+
 /// Natural sort key: split "phy12" into ("phy", 12) for proper ordering.
 fn natural_sort_key(s: &str) -> (String, u64) {
     let prefix: String = s.chars().take_while(|c| !c.is_ascii_digit()).collect();

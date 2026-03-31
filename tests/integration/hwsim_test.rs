@@ -91,7 +91,7 @@ fn test_hwsim_ptp_clocks_registered() {
     let before = count_ptp_devices();
 
     // Load tsf-ptp.
-    module_loader::load_tsf_ptp(5000).expect("failed to load tsf-ptp");
+    module_loader::load_tsf_ptp(5000, tsf_sync::sync_mode::SyncMode::Ptp, None, None).expect("failed to load tsf-ptp");
     thread::sleep(Duration::from_millis(500));
 
     let after = count_ptp_devices();
@@ -124,7 +124,7 @@ fn test_hwsim_ptp_clocks_registered() {
 #[ignore = "requires root, mac80211_hwsim, and tsf-ptp module"]
 fn test_hwsim_ptp_clock_readwrite() {
     load_hwsim(2);
-    module_loader::load_tsf_ptp(5000).expect("failed to load tsf-ptp");
+    module_loader::load_tsf_ptp(5000, tsf_sync::sync_mode::SyncMode::Ptp, None, None).expect("failed to load tsf-ptp");
     thread::sleep(Duration::from_millis(500));
 
     let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211)).unwrap();
@@ -174,7 +174,7 @@ fn test_hwsim_ptp_clock_readwrite() {
 #[ignore = "requires root, mac80211_hwsim, tsf-ptp, and ptp4l"]
 fn test_hwsim_ptp4l_convergence() {
     load_hwsim(4);
-    module_loader::load_tsf_ptp(5000).expect("failed to load tsf-ptp");
+    module_loader::load_tsf_ptp(5000, tsf_sync::sync_mode::SyncMode::Ptp, None, None).expect("failed to load tsf-ptp");
     thread::sleep(Duration::from_millis(500));
 
     let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211)).unwrap();
@@ -217,7 +217,7 @@ fn test_hwsim_ptp4l_convergence() {
 #[ignore = "requires root, mac80211_hwsim, and tsf-ptp module"]
 fn test_hwsim_many_radios() {
     load_hwsim(100);
-    module_loader::load_tsf_ptp(5000).expect("failed to load tsf-ptp");
+    module_loader::load_tsf_ptp(5000, tsf_sync::sync_mode::SyncMode::Ptp, None, None).expect("failed to load tsf-ptp");
     thread::sleep(Duration::from_secs(2));
 
     let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211)).unwrap();
@@ -240,7 +240,7 @@ fn test_hwsim_many_radios() {
 #[ignore = "requires root and mac80211_hwsim"]
 fn test_hwsim_config_generation() {
     load_hwsim(4);
-    module_loader::load_tsf_ptp(5000).expect("failed to load tsf-ptp");
+    module_loader::load_tsf_ptp(5000, tsf_sync::sync_mode::SyncMode::Ptp, None, None).expect("failed to load tsf-ptp");
     thread::sleep(Duration::from_millis(500));
 
     let cards = discovery::discover_cards(Path::new(SYSFS_IEEE80211)).unwrap();

@@ -33,6 +33,9 @@
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
 #include <linux/ptp_clock_kernel.h>
+#include <linux/workqueue.h>
+#include <linux/miscdevice.h>
+#include <linux/uaccess.h>
 #include <net/cfg80211.h>
 #include <net/mac80211.h>
 
@@ -50,6 +53,7 @@
 #include "ieee80211_i.h"
 
 #include "tsf_ptp.h"
+#include "tsf_ptp_uapi.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("tsf-sync contributors");
@@ -61,8 +65,27 @@ module_param(adjtime_threshold_ns, uint, 0644);
 MODULE_PARM_DESC(adjtime_threshold_ns,
 	"Skip set_tsf if abs(delta) < this value in ns (default: 5000 = 5us)");
 
+static unsigned int sync_mode = TSF_SYNC_MODE_PTP;
+module_param(sync_mode, uint, 0644);
+MODULE_PARM_DESC(sync_mode,
+	"Sync mode: 0=ptp (phc2sys), 1=kernel (delayed_work), 2=chardev (io_uring)");
+
+static char *sync_primary = "";
+module_param(sync_primary, charp, 0644);
+MODULE_PARM_DESC(sync_primary,
+	"PHY name of primary card (e.g. \"phy0\"), empty = first card");
+
+static unsigned int sync_interval_ms = 10;
+module_param(sync_interval_ms, uint, 0644);
+MODULE_PARM_DESC(sync_interval_ms,
+	"Kernel sync loop period in ms (default: 10, Mode B only)");
+
 static atomic64_t adjtime_skip_count = ATOMIC64_INIT(0);
 static atomic64_t adjtime_apply_count = ATOMIC64_INIT(0);
+
+/* Global sync counters (Mode B). */
+static atomic64_t global_sync_count = ATOMIC64_INIT(0);
+static atomic64_t global_sync_error_count = ATOMIC64_INIT(0);
 
 static int param_get_atomic64(char *buffer, const struct kernel_param *kp)
 {
@@ -79,6 +102,12 @@ MODULE_PARM_DESC(adjtime_skip_count, "Number of adjtime calls skipped (below thr
 
 module_param_cb(adjtime_apply_count, &param_ops_atomic64, &adjtime_apply_count, 0444);
 MODULE_PARM_DESC(adjtime_apply_count, "Number of adjtime calls applied");
+
+module_param_cb(sync_count, &param_ops_atomic64, &global_sync_count, 0444);
+MODULE_PARM_DESC(sync_count, "Completed kernel sync cycles (Mode B)");
+
+module_param_cb(sync_error_count, &param_ops_atomic64, &global_sync_error_count, 0444);
+MODULE_PARM_DESC(sync_error_count, "Kernel sync errors (Mode B)");
 
 /* Global list of all registered cards. Protected by cards_lock. */
 static LIST_HEAD(cards_list);
@@ -623,6 +652,325 @@ static void tsf_ptp_scan_existing_vifs(void)
 	}
 }
 
+/* ========== Mode B: Kernel sync loop (delayed_work) ========== */
+
+/*
+ * Uses delayed_work (not hrtimer) because TSF ops call might_sleep() —
+ * they acquire mutexes and wiphy_lock. delayed_work runs in process
+ * context via kworker. Same pattern used by ice, igb PTP drivers.
+ *
+ * Lock ordering: cards_lock → card->lock → wiphy_lock
+ */
+
+static struct delayed_work sync_work;
+
+/**
+ * Find the primary card for kernel sync.
+ * Caller must hold cards_lock.
+ */
+static struct tsf_ptp_card *find_primary_locked(void)
+{
+	struct tsf_ptp_card *card;
+	const char *prim = READ_ONCE(sync_primary);
+
+	/* If sync_primary is set, find by phy name. */
+	if (prim && prim[0]) {
+		list_for_each_entry(card, &cards_list, list) {
+			if (strcmp(card->phy_name, prim) == 0)
+				return card;
+		}
+		return NULL;
+	}
+
+	/* Default: first card in the list. */
+	if (list_empty(&cards_list))
+		return NULL;
+
+	return list_first_entry(&cards_list, struct tsf_ptp_card, list);
+}
+
+static void tsf_sync_work_fn(struct work_struct *work)
+{
+	struct tsf_ptp_card *primary, *card;
+	struct ieee80211_vif *primary_vif;
+	u64 primary_tsf;
+	unsigned int interval = READ_ONCE(sync_interval_ms);
+	unsigned int threshold = READ_ONCE(adjtime_threshold_ns);
+
+	mutex_lock(&cards_lock);
+
+	primary = find_primary_locked();
+	if (!primary) {
+		mutex_unlock(&cards_lock);
+		atomic64_inc(&global_sync_error_count);
+		goto resched;
+	}
+
+	/* Read primary TSF. */
+	mutex_lock(&primary->lock);
+	primary_vif = primary->vif;
+	if (!primary_vif) {
+		mutex_unlock(&primary->lock);
+		mutex_unlock(&cards_lock);
+		atomic64_inc(&global_sync_error_count);
+		goto resched;
+	}
+
+	wiphy_lock(primary->hw->wiphy);
+	primary_tsf = tsf_ptp_call_get_tsf(primary, primary_vif);
+	wiphy_unlock(primary->hw->wiphy);
+	mutex_unlock(&primary->lock);
+
+	/* Sync each secondary. */
+	list_for_each_entry(card, &cards_list, list) {
+		struct ieee80211_vif *vif;
+		u64 secondary_tsf;
+		s64 delta_ns;
+
+		if (card == primary)
+			continue;
+
+		mutex_lock(&card->lock);
+		vif = card->vif;
+		if (!vif) {
+			mutex_unlock(&card->lock);
+			atomic64_inc(&card->sync_error_count);
+			continue;
+		}
+
+		wiphy_lock(card->hw->wiphy);
+		secondary_tsf = tsf_ptp_call_get_tsf(card, vif);
+
+		delta_ns = (s64)(primary_tsf - secondary_tsf) * NSEC_PER_USEC;
+		card->last_offset_ns = delta_ns;
+
+		if (threshold == 0 ||
+		    (delta_ns < 0 ? -delta_ns : delta_ns) >= threshold) {
+			tsf_ptp_call_set_tsf(card, vif, primary_tsf);
+			atomic64_inc(&adjtime_apply_count);
+		} else {
+			atomic64_inc(&adjtime_skip_count);
+		}
+
+		wiphy_unlock(card->hw->wiphy);
+		mutex_unlock(&card->lock);
+
+		atomic64_inc(&card->sync_count);
+	}
+
+	mutex_unlock(&cards_lock);
+	atomic64_inc(&global_sync_count);
+
+resched:
+	if (interval == 0)
+		interval = 10;
+	schedule_delayed_work(&sync_work, msecs_to_jiffies(interval));
+}
+
+static void tsf_sync_start_kernel(void)
+{
+	pr_info("tsf-ptp: starting kernel sync loop (interval=%u ms)\n",
+		sync_interval_ms);
+	INIT_DELAYED_WORK(&sync_work, tsf_sync_work_fn);
+	schedule_delayed_work(&sync_work, msecs_to_jiffies(sync_interval_ms));
+}
+
+static void tsf_sync_stop_kernel(void)
+{
+	pr_info("tsf-ptp: stopping kernel sync loop\n");
+	cancel_delayed_work_sync(&sync_work);
+}
+
+/* ========== Mode C: Char device (/dev/tsf_sync) ========== */
+
+/*
+ * Provides a misc device /dev/tsf_sync for io_uring-based sync.
+ * - read: returns array of struct tsf_snapshot (one per card)
+ * - write: accepts array of struct tsf_adjustment (apply offsets)
+ */
+
+static ssize_t tsf_sync_chardev_read(struct file *file, char __user *buf,
+				      size_t count, loff_t *ppos)
+{
+	struct tsf_ptp_card *card;
+	struct tsf_snapshot *snaps;
+	size_t snap_size = sizeof(struct tsf_snapshot);
+	int num_cards = 0;
+	int i = 0;
+	ssize_t ret;
+
+	/* Count cards. */
+	mutex_lock(&cards_lock);
+	list_for_each_entry(card, &cards_list, list)
+		num_cards++;
+
+	if (num_cards == 0) {
+		mutex_unlock(&cards_lock);
+		return 0;
+	}
+
+	snaps = kcalloc(num_cards, snap_size, GFP_KERNEL);
+	if (!snaps) {
+		mutex_unlock(&cards_lock);
+		return -ENOMEM;
+	}
+
+	list_for_each_entry(card, &cards_list, list) {
+		struct ieee80211_vif *vif;
+		u64 tsf;
+
+		if (i >= num_cards)
+			break;
+
+		snaps[i].card_index = i;
+		snaps[i].phy_name_len = strlen(card->phy_name);
+		memcpy(snaps[i].phy_name, card->phy_name,
+		       min_t(size_t, sizeof(snaps[i].phy_name),
+			     strlen(card->phy_name)));
+
+		mutex_lock(&card->lock);
+		vif = card->vif;
+		if (vif) {
+			wiphy_lock(card->hw->wiphy);
+			tsf = tsf_ptp_call_get_tsf(card, vif);
+			wiphy_unlock(card->hw->wiphy);
+			snaps[i].tsf_ns = (s64)tsf * NSEC_PER_USEC;
+			snaps[i].mono_ns = ktime_get_ns();
+		} else {
+			snaps[i].tsf_ns = 0;
+			snaps[i].mono_ns = 0;
+		}
+		mutex_unlock(&card->lock);
+
+		i++;
+	}
+
+	mutex_unlock(&cards_lock);
+
+	/* Copy to userspace, limited by buf size. */
+	ret = min_t(size_t, count, (size_t)i * snap_size);
+	if (copy_to_user(buf, snaps, ret)) {
+		kfree(snaps);
+		return -EFAULT;
+	}
+
+	kfree(snaps);
+	return ret;
+}
+
+static ssize_t tsf_sync_chardev_write(struct file *file,
+				       const char __user *buf,
+				       size_t count, loff_t *ppos)
+{
+	struct tsf_adjustment *adjs;
+	size_t adj_size = sizeof(struct tsf_adjustment);
+	int num_adjs;
+	int i;
+	unsigned int threshold = READ_ONCE(adjtime_threshold_ns);
+
+	if (count == 0)
+		return 0;
+
+	num_adjs = count / adj_size;
+	if (num_adjs == 0)
+		return -EINVAL;
+
+	adjs = kmalloc_array(num_adjs, adj_size, GFP_KERNEL);
+	if (!adjs)
+		return -ENOMEM;
+
+	if (copy_from_user(adjs, buf, (size_t)num_adjs * adj_size)) {
+		kfree(adjs);
+		return -EFAULT;
+	}
+
+	mutex_lock(&cards_lock);
+
+	for (i = 0; i < num_adjs; i++) {
+		struct tsf_ptp_card *card;
+		struct ieee80211_vif *vif;
+		int idx = 0;
+		s64 delta_ns = adjs[i].delta_ns;
+		s64 abs_delta = delta_ns < 0 ? -delta_ns : delta_ns;
+		u64 tsf;
+
+		/* Skip if below threshold. */
+		if (threshold > 0 && abs_delta < threshold) {
+			atomic64_inc(&adjtime_skip_count);
+			continue;
+		}
+
+		/* Find card by index. */
+		list_for_each_entry(card, &cards_list, list) {
+			if (idx == adjs[i].card_index)
+				break;
+			idx++;
+		}
+
+		if (idx != adjs[i].card_index)
+			continue;
+
+		mutex_lock(&card->lock);
+		vif = card->vif;
+		if (!vif) {
+			mutex_unlock(&card->lock);
+			continue;
+		}
+
+		wiphy_lock(card->hw->wiphy);
+		tsf = tsf_ptp_call_get_tsf(card, vif);
+		tsf_ptp_call_set_tsf(card, vif,
+				     tsf + div_s64(delta_ns, NSEC_PER_USEC));
+		wiphy_unlock(card->hw->wiphy);
+		mutex_unlock(&card->lock);
+
+		atomic64_inc(&adjtime_apply_count);
+	}
+
+	mutex_unlock(&cards_lock);
+
+	kfree(adjs);
+	return (ssize_t)num_adjs * adj_size;
+}
+
+static const struct file_operations tsf_sync_chardev_fops = {
+	.owner	= THIS_MODULE,
+	.read	= tsf_sync_chardev_read,
+	.write	= tsf_sync_chardev_write,
+};
+
+static struct miscdevice tsf_sync_miscdev = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= "tsf_sync",
+	.fops	= &tsf_sync_chardev_fops,
+};
+
+static bool chardev_registered;
+
+static int tsf_sync_chardev_register(void)
+{
+	int ret;
+
+	ret = misc_register(&tsf_sync_miscdev);
+	if (ret) {
+		pr_err("tsf-ptp: failed to register /dev/tsf_sync: %d\n", ret);
+		return ret;
+	}
+
+	chardev_registered = true;
+	pr_info("tsf-ptp: registered /dev/tsf_sync char device\n");
+	return 0;
+}
+
+static void tsf_sync_chardev_unregister(void)
+{
+	if (chardev_registered) {
+		misc_deregister(&tsf_sync_miscdev);
+		chardev_registered = false;
+		pr_info("tsf-ptp: unregistered /dev/tsf_sync char device\n");
+	}
+}
+
 /* ========== Module init/exit ========== */
 
 static int __init tsf_ptp_init(void)
@@ -645,6 +993,16 @@ static int __init tsf_ptp_init(void)
 
 	pr_info("tsf-ptp: registered %d PTP clock(s)\n", count);
 
+	/* Start mode-specific sync. */
+	if (sync_mode == TSF_SYNC_MODE_KERNEL) {
+		tsf_sync_start_kernel();
+	} else if (sync_mode == TSF_SYNC_MODE_CHARDEV) {
+		int ret = tsf_sync_chardev_register();
+		if (ret)
+			pr_warn("tsf-ptp: chardev registration failed, "
+				"falling back to PTP mode\n");
+	}
+
 	return 0;
 }
 
@@ -653,6 +1011,12 @@ static void __exit tsf_ptp_exit(void)
 	struct tsf_ptp_card *card, *tmp;
 
 	pr_info("tsf-ptp: unloading module\n");
+
+	/* Stop mode-specific sync before tearing down cards. */
+	if (sync_mode == TSF_SYNC_MODE_KERNEL)
+		tsf_sync_stop_kernel();
+	else if (sync_mode == TSF_SYNC_MODE_CHARDEV)
+		tsf_sync_chardev_unregister();
 
 	/* Unregister netdev notifier first to prevent new events. */
 	unregister_netdevice_notifier(&tsf_ptp_netdev_nb);

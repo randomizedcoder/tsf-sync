@@ -84,6 +84,45 @@ For the full list of alternatives considered, see [Options Considered](options-c
 
 ---
 
+## Sync Modes
+
+The sync loop can run in three different configurations, offering a spectrum from maximum ecosystem reuse to minimum latency. All modes share the same kernel module for PTP clock registration and TSF access — they differ only in where the read → compare → correct loop executes.
+
+### Mode A: PTP + phc2sys (default)
+
+`phc2sys` runs in userspace at 10 Hz, polling both clocks via `clock_gettime`/`clock_adjtime` ioctls. The kernel module translates PTP ops to TSF reads/writes. This is the simplest mode — `phc2sys` is battle-tested, easy to debug with standard tools (strace, journald), and restartable via systemd without kernel interaction.
+
+**Overhead:** 2 syscalls per card per cycle (gettime + adjtime). Scheduling jitter ~10-100 µs. Negligible compared to firmware-based `get_tsf` latency (10-500 µs).
+
+### Mode B: Kernel sync loop
+
+A `delayed_work` timer in the kernel module calls `get_tsf`/`set_tsf` directly — no context switch, no userspace scheduling jitter. The Rust daemon monitors via sysfs counters (`sync_count`, `sync_error_count`, per-card `last_offset_ns`).
+
+We use `delayed_work` (not `hrtimer`) because TSF ops call `might_sleep()` — they acquire mutexes and `wiphy_lock`. `delayed_work` runs in process context via kworker, which is the same pattern used by in-tree PTP drivers (`ice`, `igb`).
+
+**When to use:** Sub-µs targets with register-based drivers (ath9k, rtw88) where context-switch jitter dominates.
+
+**Lock ordering:** `cards_lock` → `card->lock` → `wiphy_lock` (matches existing convention).
+
+### Mode C: io_uring + char device
+
+A `/dev/tsf_sync` misc device supports batch read/write: one `read()` returns all card TSF snapshots, one `write()` applies all adjustments. The Rust daemon uses `io_uring` to submit these as async I/O, reducing per-cycle syscalls from 2N+2 (phc2sys) to 2.
+
+**When to use:** Many cards (50-100+) where per-card syscall overhead matters, but you want the algorithm in debuggable userspace. Requires `--features iouring` at build time.
+
+### Tradeoff summary
+
+| Aspect | Mode A (phc2sys) | Mode B (kernel) | Mode C (io_uring) |
+|--------|-----------------|-----------------|-------------------|
+| Latency | ~10-100 µs jitter | Sub-µs | ~1-10 µs |
+| Fault isolation | Userspace crash, systemd restart | Kernel bug = reboot | Userspace crash, restartable |
+| Debuggability | strace, gdb, journald | printk, ftrace | strace, gdb + reduced syscalls |
+| Syscalls/cycle | 2N+2 | 0 (kernel-internal) | 2 (batch read + write) |
+| Algorithm | phc2sys PI controller | Simple offset + step | Custom Rust (same as kernel) |
+| Dependencies | linuxptp | None (kernel only) | `io-uring` crate |
+
+---
+
 ## Phased Roadmap
 
 ### Phase 1 — Single Host (current)
