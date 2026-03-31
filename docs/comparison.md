@@ -11,7 +11,7 @@ This document compares two approaches to WiFi TSF synchronization across co-loca
 
 | Characteristic | tsf-sync | FiWiTSF |
 |----------------|----------|---------|
-| **Language** | C (kernel module) + Rust (userspace) | C11 (userspace only) |
+| **Language** | C11 (kernel module, gnu11) + Rust (userspace) | C11 (userspace only) |
 | **Source LOC** | ~1,100 C (kernel) + ~2,200 Rust (userspace) | ~620 C |
 | **Components** | Kernel module, Rust CLI/daemon, phc2sys, ptp4l | Single binary |
 | **TSF access path** | Kernel module calls `get_tsf`/`set_tsf` via mac80211 ops directly | debugfs file I/O (`/sys/kernel/debug/ieee80211/phyN/netdev:wlanN/tsf`) |
