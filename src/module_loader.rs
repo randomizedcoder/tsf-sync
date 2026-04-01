@@ -18,7 +18,10 @@ const MODULE_NAME: &str = "tsf_ptp";
 
 /// Check if a kernel module is currently loaded.
 pub fn is_module_loaded(module: &str) -> Result<bool, ModuleError> {
-    is_module_loaded_from(&std::fs::read_to_string("/proc/modules").map_err(ModuleError::ProcModules)?, module)
+    is_module_loaded_from(
+        &std::fs::read_to_string("/proc/modules").map_err(ModuleError::ProcModules)?,
+        module,
+    )
 }
 
 /// Parse /proc/modules content to check if a module is loaded.
@@ -27,13 +30,11 @@ fn is_module_loaded_from(proc_modules: &str, module: &str) -> Result<bool, Modul
     // /proc/modules format: "module_name size refcount deps state offset"
     // Module names use underscores in /proc/modules regardless of how they were loaded.
     let normalized = module.replace('-', "_");
-    Ok(proc_modules
-        .lines()
-        .any(|line| {
-            line.split_whitespace()
-                .next()
-                .is_some_and(|name| name == normalized)
-        }))
+    Ok(proc_modules.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|name| name == normalized)
+    }))
 }
 
 /// Check if the tsf-ptp module is loaded.

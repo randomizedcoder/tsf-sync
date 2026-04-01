@@ -191,11 +191,12 @@ If a future deployment needs sub-µs precision and uses register-based drivers (
 
 Three sync modes offer different points on the simplicity/performance tradeoff. All modes use the same kernel module (`tsf-ptp`) for PTP clock registration and TSF access — they differ only in where the read → compare → correct loop runs.
 
-| Mode | Flag | Kernel | Userspace | When to use |
-|------|------|--------|-----------|-------------|
-| **PTP + phc2sys** (default) | `--sync-mode ptp` | PTP clocks only | Spawns `phc2sys` | Default. Maximum ecosystem reuse, easiest debugging |
-| **Kernel sync loop** | `--sync-mode kernel` | PTP clocks + `delayed_work` timer | Monitor only (sysfs) | Lowest latency. No context switch. For sub-µs targets with register-based drivers |
-| **io_uring** | `--sync-mode iouring` | PTP clocks + `/dev/tsf_sync` char device | `io-uring` crate, batch read/write | Middle ground. Userspace algorithm with reduced syscall overhead |
+| Mode | Flag / Binary | Kernel | Userspace | When to use |
+|------|---------------|--------|-----------|-------------|
+| **A: PTP + phc2sys** (default) | `--sync-mode ptp` | PTP clocks only | Spawns `phc2sys` | Default. Maximum ecosystem reuse, easiest debugging |
+| **B: Kernel sync loop** | `--sync-mode kernel` | PTP clocks + `delayed_work` timer | Monitor only (sysfs) | Lowest latency. No context switch. For sub-µs targets with register-based drivers |
+| **C: io_uring** | `--sync-mode iouring` | PTP clocks + `/dev/tsf_sync` char device | `io-uring` crate, batch read/write | Middle ground. Userspace algorithm with reduced syscall overhead |
+| **D: Rust debugfs** | `tsf-sync-debugfs` | None (uses debugfs) | pread/pwrite + SIMD | No kernel module needed. Lab bring-up, benchmarking |
 
 ### Usage examples
 
@@ -292,6 +293,7 @@ No code changes from single-host to multi-host — just a `ptp4l` configuration 
 |-----------|-----------|-------------|
 | **[`tsf-ptp`](docs/kernel-module.md)** | Out-of-tree Linux kernel module | Registers a PTP clock (`/dev/ptpN`) per WiFi phy that has mac80211 `get_tsf`/`set_tsf`. |
 | **[`tsf-sync`](docs/userspace-tool.md)** | Rust CLI / NixOS service | Discovers cards, generates `ptp4l` config, manages lifecycle, monitors health. |
+| **[`tsf-sync-debugfs`](docs/debugfs-tool.md)** | Standalone Rust binary | Debugfs-based TSF sync with cached FDs, inline syscalls, SIMD hex parser. No kernel module needed. |
 
 ### What upstream provides (we don't maintain)
 
@@ -346,7 +348,7 @@ tsf-sync/
 │       ├── test_hwsim.sh              # Full integration test with hwsim
 │       └── validate_hwsim_tsf.sh      # Foundation validation (no module needed)
 │
-├── src/                               # Rust userspace tool
+├── src/                               # Rust userspace tools
 │   ├── main.rs                        # CLI entry (discover, config, start, status, stop)
 │   ├── lib.rs                         # Re-exports
 │   ├── sync_mode.rs                   # SyncMode enum, UAPI struct definitions
@@ -356,7 +358,19 @@ tsf-sync/
 │   ├── health.rs                      # Health monitoring via pmc + sysfs
 │   ├── ptp4l.rs                       # ptp4l process management
 │   ├── iouring_sync.rs               # io_uring sync loop (Mode C, feature-gated)
-│   └── module_loader.rs               # Kernel module loading/unloading
+│   ├── module_loader.rs               # Kernel module loading/unloading
+│   └── bin/tsf_sync_debugfs/         # Standalone debugfs sync tool (Mode D)
+│       ├── main.rs                    # Entry point
+│       ├── cli.rs                     # Clap argument parsing
+│       ├── debugfs.rs                 # Cached fd TSF I/O (pread/pwrite)
+│       ├── asm/                       # Architecture-specific hot-path optimizations
+│       │   ├── syscall.rs             # Inline x86_64 syscall wrappers
+│       │   └── hex.rs                 # SSSE3 SIMD hex parser + scalar fallback
+│       ├── control.rs                 # Proportional controller + Kalman filter
+│       ├── stats.rs                   # Welford online statistics
+│       ├── rt.rs                      # RT scheduling (mlockall, SCHED_FIFO, affinity)
+│       ├── signal.rs                  # SIGINT/SIGTERM handler
+│       └── threading.rs              # Single + parallel sync loops
 │
 ├── tests/                             # Rust tests
 │   ├── discovery_test.rs
@@ -371,13 +385,20 @@ tsf-sync/
 │   ├── devshell.nix                   # Development shell (Rust + kernel headers)
 │   ├── ci.nix                         # CI checks (fmt, clippy, test, build)
 │   ├── module.nix                     # NixOS service module (systemd)
-│   ├── scripts.nix                    # Test/build helper scripts
+│   ├── scripts.nix                    # Test/build/benchmark helper scripts
 │   ├── overlays/                      # Nixpkgs overlays for cross builds
-│   └── tests/microvm/                 # MicroVM lifecycle testing
+│   └── tests/microvm/                 # MicroVM lifecycle testing & benchmarks
 │       ├── constants.nix              # Arch defs, ports, timeouts, variants
 │       ├── microvm.nix                # VM generator (hwsim + tsf_ptp)
-│       └── lifecycle/                 # Phased test scripts (boot → verify → shutdown)
+│       ├── lifecycle/                 # Phased test scripts (boot → verify → shutdown)
+│       └── benchmark/                 # Head-to-head all-modes benchmark harness
 │
+├── benches/
+│   └── hot_path.rs                    # Criterion benchmarks (SIMD, syscall, decimal)
+├── bench/
+│   └── fiwitsf.nix                    # Nix derivation for FiWiTSF (C reference)
+├── scripts/
+│   └── check-asm.sh                   # Automated assembly verification (7 checks)
 ├── flake.nix
 ├── Cargo.toml
 └── LICENSE
@@ -417,6 +438,8 @@ tsf-sync/
 | [Driver Compatibility Survey](docs/driver-survey.md) | TSF/PTP support across all Linux WiFi drivers | Complete |
 | [Kernel Module: tsf-ptp](docs/kernel-module.md) | Module design, PTP↔mac80211 mapping, challenges | Complete |
 | [Userspace Tool: tsf-sync](docs/userspace-tool.md) | CLI, daemon mode, discovery, config generation | Complete |
+| [Debugfs Tool: tsf-sync-debugfs](docs/debugfs-tool.md) | Standalone debugfs sync, SIMD, inline syscalls, benchmarks | Complete |
+| [Comparison: tsf-sync vs FiWiTSF](docs/comparison.md) | Head-to-head analysis, all 5 sync modes, benchmark results | Complete |
 | [PTP Topology & Scaling](docs/ptp-topology.md) | Single-host, multi-host, GPS input configurations | Complete |
 | [WiFi Timing Requirements](docs/wifi-timing.md) | 802.11 timing, sync accuracy targets, threshold tuning | Complete |
 | [Testing Strategy](docs/testing.md) | mac80211_hwsim, integration tests, test matrix | Complete |

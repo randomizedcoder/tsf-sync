@@ -9,7 +9,10 @@ use tsf_sync::discovery;
 use tsf_sync::sync_mode::SyncMode;
 
 #[derive(Parser, Debug)]
-#[command(name = "tsf-sync", about = "Bridge WiFi TSF into the Linux PTP subsystem")]
+#[command(
+    name = "tsf-sync",
+    about = "Bridge WiFi TSF into the Linux PTP subsystem"
+)]
 struct Cli {
     /// Log level (trace, debug, info, warn, error).
     #[arg(short, long, default_value = "info", global = true)]
@@ -137,14 +140,28 @@ fn run(command: Command, linuxptp_bin: &str) -> Result<(), Box<dyn std::error::E
             }
         }
 
-        Command::Start { primary, adjtime_threshold_ns, sync_mode, sync_interval_ms } => {
+        Command::Start {
+            primary,
+            adjtime_threshold_ns,
+            sync_mode,
+            sync_interval_ms,
+        } => {
             #[cfg(not(feature = "iouring"))]
             if matches!(sync_mode, SyncMode::Iouring) {
                 return Err("iouring sync mode requires --features iouring".into());
             }
 
-            let _state = daemon::start(&primary, linuxptp_bin, adjtime_threshold_ns, sync_mode, sync_interval_ms)?;
-            tracing::info!("tsf-sync started (mode: {}). Press Ctrl-C to stop.", sync_mode);
+            let _state = daemon::start(
+                &primary,
+                linuxptp_bin,
+                adjtime_threshold_ns,
+                sync_mode,
+                sync_interval_ms,
+            )?;
+            tracing::info!(
+                "tsf-sync started (mode: {}). Press Ctrl-C to stop.",
+                sync_mode
+            );
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
             }
@@ -158,7 +175,13 @@ fn run(command: Command, linuxptp_bin: &str) -> Result<(), Box<dyn std::error::E
             daemon::stop(&mut daemon::SyncState::Phc2sys(Vec::new()))?;
         }
 
-        Command::Daemon { primary, interval, adjtime_threshold_ns, sync_mode, sync_interval_ms } => {
+        Command::Daemon {
+            primary,
+            interval,
+            adjtime_threshold_ns,
+            sync_mode,
+            sync_interval_ms,
+        } => {
             #[cfg(not(feature = "iouring"))]
             if matches!(sync_mode, SyncMode::Iouring) {
                 return Err("iouring sync mode requires --features iouring".into());
@@ -166,7 +189,14 @@ fn run(command: Command, linuxptp_bin: &str) -> Result<(), Box<dyn std::error::E
 
             let interval = daemon::parse_interval(&interval)
                 .map_err(|e| format!("invalid interval: {}", e))?;
-            daemon::run_daemon(&primary, interval, linuxptp_bin, adjtime_threshold_ns, sync_mode, sync_interval_ms)?;
+            daemon::run_daemon(
+                &primary,
+                interval,
+                linuxptp_bin,
+                adjtime_threshold_ns,
+                sync_mode,
+                sync_interval_ms,
+            )?;
         }
     }
 

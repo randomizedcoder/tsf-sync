@@ -44,6 +44,7 @@ let
       radios ? 4,
       threshold ? 5000,
       syncMode ? 0,
+      extraPackages ? [],
       ...
     }:
     let
@@ -200,7 +201,7 @@ let
                 pkgs.kmod
                 pkgs.iw
                 pkgs.ethtool
-              ];
+              ] ++ extraPackages;
 
               # ─── SSH for lifecycle tests ───────────────────────────────────
               services.openssh = {

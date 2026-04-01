@@ -21,10 +21,7 @@ pub enum ConfigError {
 /// Generate a ptp4l configuration file from discovered cards.
 ///
 /// `primary_selection` is either "auto" or a specific phy name (e.g., "phy0").
-pub fn generate_config(
-    cards: &[WifiCard],
-    primary_selection: &str,
-) -> Result<String, ConfigError> {
+pub fn generate_config(cards: &[WifiCard], primary_selection: &str) -> Result<String, ConfigError> {
     // Filter to cards with PTP clocks.
     let ptp_cards: Vec<&WifiCard> = cards.iter().filter(|c| c.ptp_clock.is_some()).collect();
 

@@ -62,15 +62,7 @@ const HEALTHY_THRESHOLD_NS: i64 = 1_000_000;
 /// `uds_path` is the path to the ptp4l UDS socket (default: /var/run/ptp4l).
 pub fn query_health(uds_path: &str) -> Result<Vec<ClockStatus>, HealthError> {
     let output = Command::new("pmc")
-        .args([
-            "-u",
-            "-b",
-            "0",
-            "-s",
-            uds_path,
-            "GET",
-            "PORT_DATA_SET",
-        ])
+        .args(["-u", "-b", "0", "-s", uds_path, "GET", "PORT_DATA_SET"])
         .output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

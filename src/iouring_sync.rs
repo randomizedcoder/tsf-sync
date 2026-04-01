@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types::Fd;
+use io_uring::IoUring;
 
 use crate::sync_mode::{TsfAdjustment, TsfSnapshot};
 
@@ -44,15 +44,8 @@ impl IoUringSyncer {
     ///
     /// `primary_index` is the card index of the primary clock (from discovery).
     /// `threshold_ns` mirrors the kernel's adjtime_threshold_ns.
-    pub fn new(
-        primary_index: u32,
-        threshold_ns: i64,
-        interval: Duration,
-    ) -> std::io::Result<Self> {
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(DEV_PATH)?;
+    pub fn new(primary_index: u32, threshold_ns: i64, interval: Duration) -> std::io::Result<Self> {
+        let fd = OpenOptions::new().read(true).write(true).open(DEV_PATH)?;
 
         let ring = IoUring::new(8)?;
 
@@ -78,10 +71,16 @@ impl IoUringSyncer {
         }
 
         // Find primary TSF.
-        let primary_tsf = match snapshots.iter().find(|s| s.card_index == self.primary_index) {
+        let primary_tsf = match snapshots
+            .iter()
+            .find(|s| s.card_index == self.primary_index)
+        {
             Some(s) => s.tsf_ns,
             None => {
-                tracing::warn!(index = self.primary_index, "primary card not found in snapshots");
+                tracing::warn!(
+                    index = self.primary_index,
+                    "primary card not found in snapshots"
+                );
                 return Ok(stats);
             }
         };
@@ -124,22 +123,23 @@ impl IoUringSyncer {
         let snapshot_size = std::mem::size_of::<TsfSnapshot>();
         let mut buf = vec![0u8; snapshot_size * MAX_CARDS];
 
-        let read_e = opcode::Read::new(
-            Fd(self.fd.as_raw_fd()),
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-        )
-        .build()
-        .user_data(0x01);
+        let read_e = opcode::Read::new(Fd(self.fd.as_raw_fd()), buf.as_mut_ptr(), buf.len() as u32)
+            .build()
+            .user_data(0x01);
 
         unsafe {
-            self.ring.submission().push(&read_e)
+            self.ring
+                .submission()
+                .push(&read_e)
                 .map_err(|_| std::io::Error::other("io_uring submission full"))?;
         }
 
         self.ring.submit_and_wait(1)?;
 
-        let cqe = self.ring.completion().next()
+        let cqe = self
+            .ring
+            .completion()
+            .next()
             .ok_or_else(|| std::io::Error::other("no io_uring completion"))?;
 
         let bytes_read = cqe.result();
@@ -153,9 +153,8 @@ impl IoUringSyncer {
         let mut snapshots = Vec::with_capacity(count);
         for i in 0..count {
             let offset = i * snapshot_size;
-            let snap: TsfSnapshot = unsafe {
-                std::ptr::read_unaligned(buf[offset..].as_ptr() as *const TsfSnapshot)
-            };
+            let snap: TsfSnapshot =
+                unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr() as *const TsfSnapshot) };
             snapshots.push(snap);
         }
 
@@ -166,29 +165,32 @@ impl IoUringSyncer {
     fn write_adjustments(&mut self, adjustments: &[TsfAdjustment]) -> std::io::Result<()> {
         let adj_size = std::mem::size_of::<TsfAdjustment>();
         let total = adj_size * adjustments.len();
-        let buf: Vec<u8> = adjustments.iter().flat_map(|a| {
-            let bytes: [u8; std::mem::size_of::<TsfAdjustment>()] = unsafe {
-                std::mem::transmute_copy(a)
-            };
-            bytes.to_vec()
-        }).collect();
+        let buf: Vec<u8> = adjustments
+            .iter()
+            .flat_map(|a| {
+                let bytes: [u8; std::mem::size_of::<TsfAdjustment>()] =
+                    unsafe { std::mem::transmute_copy(a) };
+                bytes.to_vec()
+            })
+            .collect();
 
-        let write_e = opcode::Write::new(
-            Fd(self.fd.as_raw_fd()),
-            buf.as_ptr(),
-            total as u32,
-        )
-        .build()
-        .user_data(0x02);
+        let write_e = opcode::Write::new(Fd(self.fd.as_raw_fd()), buf.as_ptr(), total as u32)
+            .build()
+            .user_data(0x02);
 
         unsafe {
-            self.ring.submission().push(&write_e)
+            self.ring
+                .submission()
+                .push(&write_e)
                 .map_err(|_| std::io::Error::other("io_uring submission full"))?;
         }
 
         self.ring.submit_and_wait(1)?;
 
-        let cqe = self.ring.completion().next()
+        let cqe = self
+            .ring
+            .completion()
+            .next()
             .ok_or_else(|| std::io::Error::other("no io_uring completion"))?;
 
         let result = cqe.result();
@@ -245,9 +247,8 @@ pub fn find_primary_index(primary_phy: &str) -> std::io::Result<u32> {
     let count = bytes_read / snapshot_size;
     for i in 0..count {
         let offset = i * snapshot_size;
-        let snap: TsfSnapshot = unsafe {
-            std::ptr::read_unaligned(buf[offset..].as_ptr() as *const TsfSnapshot)
-        };
+        let snap: TsfSnapshot =
+            unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr() as *const TsfSnapshot) };
 
         let name_len = snap.phy_name_len as usize;
         let name = std::str::from_utf8(&snap.phy_name[..name_len.min(32)])

@@ -1,6 +1,6 @@
 # Project Status
 
-> Last updated: 2026-03-29
+> Last updated: 2026-04-01
 
 ---
 
@@ -41,6 +41,19 @@
   - [x] Read-only PTP clocks for drivers with `get_tsf` but no `set_tsf`
   - [x] Clean module exit with PTP clock unregistration
 - [x] **Integration test implementations** — hwsim_test.rs with 6 tests (discovery, PTP registration, read/write, ptp4l convergence, 100-radio stress, config generation)
+- [x] **Debugfs sync tool** — `tsf-sync-debugfs` standalone binary reimplementing FiWiTSF in Rust with cached FDs, inline syscalls, SSSE3 SIMD hex parsing (53 unit tests)
+  - [x] Cached file descriptors — pread/pwrite (1 syscall) vs open/read/close (3 syscalls), ~3x reduction
+  - [x] x86_64 inline `syscall` wrappers — bypass libc PLT indirection
+  - [x] SSSE3 SIMD hex parser — PMADDUBSW+PMADDWD+PSHUFB pipeline with scalar fallback
+  - [x] Proportional controller with optional 1D Kalman filter
+  - [x] Single-threaded and barrier-synchronized parallel modes
+  - [x] Assembly verification checks (`nix run .#check-asm`) — 7 automated checks
+  - [x] Criterion microbenchmarks (`nix run .#bench-hot-path`)
+- [x] **Benchmark infrastructure** — head-to-head comparison of all 5 sync modes in microVM
+  - [x] FiWiTSF Nix derivation (`bench/fiwitsf.nix`)
+  - [x] MicroVM benchmark harness (`nix/tests/microvm/benchmark/`)
+  - [x] 4/24/100-radio benchmark variants
+  - [x] strace syscall counting + `/usr/bin/time -v` resource stats
 
 ### Verified with root + kernel headers (2026-03-30)
 
@@ -85,7 +98,8 @@
 | `ptp4l` (unit) | 2 | All passing |
 | `daemon` (unit) | 2 | All passing |
 | `hwsim` (integration) | 6 | Written, needs root |
-| **Total** | **54** | **48 passing, 6 need root** |
+| `tsf-sync-debugfs` (unit) | 53 | All passing |
+| **Total** | **107** | **101 passing, 6 need root** |
 
 ---
 
@@ -118,7 +132,8 @@ Not started. Depends on Phase 1 being stable.
 
 | Decision | Chosen | Over | Why |
 |----------|--------|------|-----|
-| TSF access | PTP clock (kernel module) | debugfs, eBPF, nl80211 | Stable ABI, integrates with PTP ecosystem, works for ~20 drivers |
+| TSF access (production) | PTP clock (kernel module) | debugfs, eBPF, nl80211 | Stable ABI, integrates with PTP ecosystem, works for ~20 drivers |
+| TSF access (lab/debug) | debugfs via `tsf-sync-debugfs` | FiWiTSF (C) | 3x fewer syscalls via cached FDs, SIMD parsing, no kernel module needed |
 | Sync protocol | PTP (IEEE 1588) via `ptp4l` | Custom daemon, SeqLock+futex, tokio | Don't reinvent clock sync. Multi-host for free. Datacenter-proven. |
 | Distribution | `ptp4l` handles it | Shared memory, channels, multicast | PTP eliminates the need for custom distribution |
 | Testing | mac80211_hwsim | Real hardware only | Virtual driver with `get_tsf`/`set_tsf`, no hardware needed, CI-friendly |

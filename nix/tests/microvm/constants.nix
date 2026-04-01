@@ -72,6 +72,13 @@ rec {
       syncMode = 1;
       description = "4 radios — tests kernel sync mode (sync_mode=1)";
     };
+    benchmark = {
+      portOffset = 300;
+      radios = 4;
+      threshold = 5000;
+      syncMode = 0;
+      description = "benchmark VM — head-to-head C vs Rust comparison";
+    };
   };
 
   # ─── Per-arch timeouts ─────────────────────────────────────────────────
