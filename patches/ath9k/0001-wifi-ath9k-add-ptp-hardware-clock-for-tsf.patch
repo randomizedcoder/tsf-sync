@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH] wifi: ath9k: add PTP hardware clock for TSF synchronization
+
+Register a PTP hardware clock (/dev/ptpN) for each ath9k device,
+exposing the 802.11 TSF timer to the Linux PTP subsystem. This enables
+phc2sys to synchronize TSF counters across co-located radios without
+any out-of-tree kernel module.
+
+PTP clock operations map directly to existing hardware access:
+  gettime64  -> ath9k_hw_gettsf64() (register read AR_TSF_L32/U32)
+  settime64  -> ath9k_hw_settsf64() (register write)
+  adjtime    -> read-modify-write via ath9k_hw functions
+  adjfine    -> no-op (fixed crystal oscillator, no frequency tuning)
+
+TSF values are in microseconds (802.11 spec); the PTP interface uses
+nanoseconds. Conversion: tsf_ns = tsf_usec * NSEC_PER_USEC.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ drivers/net/wireless/ath/ath9k/Kconfig  |   1 +
+ drivers/net/wireless/ath/ath9k/Makefile |   2 +
+ drivers/net/wireless/ath/ath9k/ath9k.h  |   6 ++
+ drivers/net/wireless/ath/ath9k/init.c   |   3 +
+ drivers/net/wireless/ath/ath9k/ptp.c    | 113 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath9k/ptp.h    |  28 ++++++
+ 6 files changed, 153 insertions(+)
+ create mode 100644 drivers/net/wireless/ath/ath9k/ptp.c
+ create mode 100644 drivers/net/wireless/ath/ath9k/ptp.h
+
+diff --git a/drivers/net/wireless/ath/ath9k/Kconfig b/drivers/net/wireless/ath/ath9k/Kconfig
+--- a/drivers/net/wireless/ath/ath9k/Kconfig
++++ b/drivers/net/wireless/ath/ath9k/Kconfig
+@@ -21,6 +21,7 @@ config ATH9K
+ 	tristate "Atheros 802.11n wireless cards support"
+ 	depends on MAC80211 && HAS_DMA
+ 	select MAC80211_LEDS if LEDS_CLASS=y || LEDS_CLASS=MAC80211
++	select PTP_1588_CLOCK_OPTIONAL
+ 	select ATH9K_HW
+ 	select ATH9K_COMMON
+ 	help
+diff --git a/drivers/net/wireless/ath/ath9k/Makefile b/drivers/net/wireless/ath/ath9k/Makefile
+--- a/drivers/net/wireless/ath/ath9k/Makefile
++++ b/drivers/net/wireless/ath/ath9k/Makefile
+@@ -8,6 +8,8 @@ ath9k-y +=	beacon.o \
+ 		antenna.o \
+ 		channel.o
+
++ath9k-$(CONFIG_PTP_1588_CLOCK) += ptp.o
++
+ ath9k-$(CONFIG_ATH9K_BTCOEX_SUPPORT) += mci.o
+ ath9k-$(CONFIG_ATH9K_PCI) += pci.o
+ ath9k-$(CONFIG_ATH9K_AHB) += ahb.o
+diff --git a/drivers/net/wireless/ath/ath9k/ath9k.h b/drivers/net/wireless/ath/ath9k/ath9k.h
+--- a/drivers/net/wireless/ath/ath9k/ath9k.h
++++ b/drivers/net/wireless/ath/ath9k/ath9k.h
+@@ -25,6 +25,7 @@
+ #include <linux/completion.h>
+ #include <linux/time.h>
+ #include <linux/hw_random.h>
++#include <linux/ptp_clock_kernel.h>
+
+ #include "common.h"
+ #include "debug.h"
+@@ -1076,6 +1077,11 @@ struct ath_softc {
+ 	u32 rng_last;
+ 	char rng_name[sizeof("ath9k_65535")];
+ #endif
++
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++	struct ptp_clock *ptp_clock;
++	struct ptp_clock_info ptp_info;
++#endif
+ };
+
+ /********/
+diff --git a/drivers/net/wireless/ath/ath9k/init.c b/drivers/net/wireless/ath/ath9k/init.c
+--- a/drivers/net/wireless/ath/ath9k/init.c
++++ b/drivers/net/wireless/ath/ath9k/init.c
+@@ -28,6 +28,7 @@
+ #include <net/ieee80211_radiotap.h>
+
+ #include "ath9k.h"
++#include "ptp.h"
+
+ struct ath9k_eeprom_ctx {
+ 	struct completion complete;
+@@ -1117,6 +1118,7 @@ int ath9k_init_device(u16 devid, struct ath_softc *sc,
+ 	ath_init_leds(sc);
+ 	ath_start_rfkill_poll(sc);
+
++	ath9k_ptp_init(sc);
+ 	return 0;
+
+ debug_cleanup:
+@@ -1158,6 +1160,7 @@ void ath9k_deinit_device(struct ath_softc *sc)
+
+ 	ath9k_ps_wakeup(sc);
+
++	ath9k_ptp_remove(sc);
+ 	wiphy_rfkill_stop_polling(sc->hw->wiphy);
+ 	ath_deinit_leds(sc);
+
+diff --git a/drivers/net/wireless/ath/ath9k/ptp.c b/drivers/net/wireless/ath/ath9k/ptp.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath9k/ptp.c
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: ISC
++/*
++ * ath9k PTP hardware clock -- expose TSF as /dev/ptpN
++ *
++ * Maps PTP clock ops to ath9k's direct register-based TSF access:
++ *   gettime64  -> ath9k_hw_gettsf64()  (reads AR_TSF_L32 + AR_TSF_U32)
++ *   settime64  -> ath9k_hw_settsf64()  (writes AR_TSF_L32 + AR_TSF_U32)
++ *   adjtime    -> read-modify-write
++ *   adjfine    -> no-op (fixed crystal)
++ *
++ * TSF is in microseconds (802.11); PTP is in nanoseconds.
++ * Conversion: ns = usec * NSEC_PER_USEC (1000).
++ */
++
++#include <linux/ptp_clock_kernel.h>
++#include "ath9k.h"
++#include "ptp.h"
++
++static int ath9k_ptp_gettime64(struct ptp_clock_info *ptp,
++			       struct timespec64 *ts)
++{
++	struct ath_softc *sc = container_of(ptp, struct ath_softc, ptp_info);
++	u64 tsf;
++
++	mutex_lock(&sc->mutex);
++	tsf = ath9k_hw_gettsf64(sc->sc_ah);
++	mutex_unlock(&sc->mutex);
++
++	*ts = ns_to_timespec64((s64)tsf * NSEC_PER_USEC);
++	return 0;
++}
++
++static int ath9k_ptp_settime64(struct ptp_clock_info *ptp,
++			       const struct timespec64 *ts)
++{
++	struct ath_softc *sc = container_of(ptp, struct ath_softc, ptp_info);
++	u64 tsf;
++
++	tsf = div_u64(timespec64_to_ns(ts), NSEC_PER_USEC);
++
++	mutex_lock(&sc->mutex);
++	ath9k_hw_settsf64(sc->sc_ah, tsf);
++	mutex_unlock(&sc->mutex);
++
++	return 0;
++}
++
++static int ath9k_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
++{
++	struct ath_softc *sc = container_of(ptp, struct ath_softc, ptp_info);
++	u64 tsf;
++	s64 delta_usec;
++
++	delta_usec = div_s64(delta_ns, NSEC_PER_USEC);
++
++	mutex_lock(&sc->mutex);
++	tsf = ath9k_hw_gettsf64(sc->sc_ah);
++	ath9k_hw_settsf64(sc->sc_ah, tsf + delta_usec);
++	mutex_unlock(&sc->mutex);
++
++	return 0;
++}
++
++static int ath9k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++{
++	/*
++	 * WiFi cards use a fixed crystal oscillator -- no hardware frequency
++	 * tuning. Return 0 so tools like phc2sys consider the clock
++	 * adjustable. Actual sync happens via time-stepping (adjtime).
++	 */
++	return 0;
++}
++
++void ath9k_ptp_init(struct ath_softc *sc)
++{
++	struct ptp_clock_info *info = &sc->ptp_info;
++
++	memset(info, 0, sizeof(*info));
++	info->owner = THIS_MODULE;
++	snprintf(info->name, sizeof(info->name), "ath9k-%s",
++		 wiphy_name(sc->hw->wiphy));
++	info->max_adj = 500000000;
++	info->gettime64 = ath9k_ptp_gettime64;
++	info->settime64 = ath9k_ptp_settime64;
++	info->adjtime = ath9k_ptp_adjtime;
++	info->adjfine = ath9k_ptp_adjfine;
++
++	sc->ptp_clock = ptp_clock_register(info, sc->dev);
++	if (IS_ERR(sc->ptp_clock)) {
++		ath_err(ath9k_hw_common(sc->sc_ah),
++			"PTP clock registration failed: %ld\n",
++			PTR_ERR(sc->ptp_clock));
++		sc->ptp_clock = NULL;
++		return;
++	}
++
++	ath_info(ath9k_hw_common(sc->sc_ah),
++		 "registered PTP clock (ptp%d)\n",
++		 ptp_clock_index(sc->ptp_clock));
++}
++
++void ath9k_ptp_remove(struct ath_softc *sc)
++{
++	if (sc->ptp_clock) {
++		ptp_clock_unregister(sc->ptp_clock);
++		sc->ptp_clock = NULL;
++	}
++}
++
+diff --git a/drivers/net/wireless/ath/ath9k/ptp.h b/drivers/net/wireless/ath/ath9k/ptp.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath9k/ptp.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: ISC */
++/*
++ * ath9k PTP hardware clock declarations.
++ *
++ * Provides PTP clock registration/removal for TSF synchronization.
++ * The PTP clock maps gettime64/settime64/adjtime to ath9k's direct
++ * register-based TSF access (AR_TSF_L32/AR_TSF_U32).
++ */
++
++#ifndef ATH9K_PTP_H
++#define ATH9K_PTP_H
++
++struct ath_softc;
++
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++
++void ath9k_ptp_init(struct ath_softc *sc);
++void ath9k_ptp_remove(struct ath_softc *sc);
++
++#else
++
++static inline void ath9k_ptp_init(struct ath_softc *sc) {}
++static inline void ath9k_ptp_remove(struct ath_softc *sc) {}
++
++#endif /* CONFIG_PTP_1588_CLOCK */
++
++#endif /* ATH9K_PTP_H */

@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH] wifi: ath10k: add PTP hardware clock for TSF synchronization
+
+Register a PTP hardware clock (/dev/ptpN) for each ath10k device,
+exposing the 802.11 TSF timer to the Linux PTP subsystem.
+
+ath10k accesses TSF via WMI firmware commands (not direct register
+reads), which adds latency per access. The PTP ops use the WMI path:
+  adjtime    -> WMI vdev inc_tsf / dec_tsf params
+  gettime64  -> WMI stats request with completion-based wait
+  adjfine    -> no-op (fixed crystal)
+
+This higher latency limits achievable sync precision compared to
+register-based drivers (ath9k, rtw88), but is still useful for
+coarse TSF alignment across co-located QCA988x/QCA6174 radios.
+
+The PTP clock is registered when the first vdev is created and stores
+the vdev_id for TSF access.
+
+Covers: QCA988x, QCA6174, QCA9377, QCA9984.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ drivers/net/wireless/ath/ath10k/Kconfig  |   1 +
+ drivers/net/wireless/ath/ath10k/Makefile |   1 +
+ drivers/net/wireless/ath/ath10k/core.h   |  11 ++
+ drivers/net/wireless/ath/ath10k/core.c   |   5 +
+ drivers/net/wireless/ath/ath10k/mac.c    |   5 +
+ drivers/net/wireless/ath/ath10k/ptp.c    | 179 ++++++++++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath10k/ptp.h    |  21 +++++
+ 7 files changed, 224 insertions(+)
+ create mode 100644 drivers/net/wireless/ath/ath10k/ptp.c
+ create mode 100644 drivers/net/wireless/ath/ath10k/ptp.h
+
+diff --git a/drivers/net/wireless/ath/ath10k/Kconfig b/drivers/net/wireless/ath/ath10k/Kconfig
+--- a/drivers/net/wireless/ath/ath10k/Kconfig
++++ b/drivers/net/wireless/ath/ath10k/Kconfig
+@@ -6,6 +6,7 @@ config ATH10K
+ 	select CRC32
+ 	select WANT_DEV_COREDUMP
+ 	select ATH10K_CE
++	select PTP_1588_CLOCK_OPTIONAL
+ 	help
+ 	  This module adds support for wireless adapters based on
+ 	  Atheros IEEE 802.11ac family of chipsets.
+diff --git a/drivers/net/wireless/ath/ath10k/Makefile b/drivers/net/wireless/ath/ath10k/Makefile
+--- a/drivers/net/wireless/ath/ath10k/Makefile
++++ b/drivers/net/wireless/ath/ath10k/Makefile
+@@ -25,6 +25,7 @@ ath10k_core-$(CONFIG_PM) += wow.o
+ ath10k_core-$(CONFIG_DEV_COREDUMP) += coredump.o
+ ath10k_core-$(CONFIG_ATH10K_CE) += ce.o
+ 
++ath10k_core-$(CONFIG_PTP_1588_CLOCK) += ptp.o
+ obj-$(CONFIG_ATH10K_PCI) += ath10k_pci.o
+ ath10k_pci-y += pci.o
+ 
+diff --git a/drivers/net/wireless/ath/ath10k/core.h b/drivers/net/wireless/ath/ath10k/core.h
+--- a/drivers/net/wireless/ath/ath10k/core.h
++++ b/drivers/net/wireless/ath/ath10k/core.h
+@@ -16,6 +16,7 @@
+ #include <linux/uuid.h>
+ #include <linux/time.h>
+ #include <linux/leds.h>
++#include <linux/ptp_clock_kernel.h>
+ 
+ #include "htt.h"
+ #include "htc.h"
+@@ -1315,6 +1316,16 @@ struct ath10k {
+ 	s32 tx_power_2g_limit;
+ 	s32 tx_power_5g_limit;
+ 
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++	struct ptp_clock *ptp_clock;
++	struct ptp_clock_info ptp_info;
++	/* vdev_id for TSF access via WMI. Set when first vdev is created.
++	 * Protected by conf_mutex. -1 when no vdev active. */
++	int ptp_vdev_id;
++	struct completion tsf_read_complete;
++	u64 tsf_read_value;
++#endif
++
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+diff --git a/drivers/net/wireless/ath/ath10k/core.c b/drivers/net/wireless/ath/ath10k/core.c
+--- a/drivers/net/wireless/ath/ath10k/core.c
++++ b/drivers/net/wireless/ath/ath10k/core.c
+@@ -27,6 +27,7 @@
+ #include "testmode.h"
+ #include "wmi-ops.h"
+ #include "coredump.h"
++#include "ptp.h"
+ #include "leds.h"
+ 
+ unsigned int ath10k_debug_mask;
+@@ -3540,6 +3541,8 @@ int ath10k_core_register(struct ath10k *ar,
+ 
+ 	queue_work(ar->workqueue, &ar->register_work);
+ 
++	ath10k_ptp_init(ar);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(ath10k_core_register);
+@@ -3553,6 +3556,8 @@ void ath10k_core_unregister(struct ath10k *ar)
+ 
+ 	ath10k_leds_unregister(ar);
+ 
++	ath10k_ptp_remove(ar);
++
+ 	ath10k_thermal_unregister(ar);
+ 	/* Stop spectral before unregistering from mac80211 to remove the
+ 	 * relayfs debugfs file cleanly. Otherwise the parent debugfs tree
+diff --git a/drivers/net/wireless/ath/ath10k/mac.c b/drivers/net/wireless/ath/ath10k/mac.c
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -24,6 +24,7 @@
+ #include "testmode.h"
+ #include "wmi-tlv.h"
+ #include "wmi-ops.h"
++#include "ptp.h"
+ #include "wow.h"
+ #include "leds.h"
+ 
+@@ -5853,5 +5854,9 @@ static int ath10k_add_interface(struct ieee80211_hw *hw,
+ 	spin_unlock_bh(&ar->htt.tx_lock);
+ 
++	/* Register PTP clock on first vdev creation. */
++	if (ar->ptp_vdev_id < 0)
++		ath10k_ptp_start(ar, arvif->vdev_id);
++
+ 	mutex_unlock(&ar->conf_mutex);
+ 	return 0;
+ 
+diff --git a/drivers/net/wireless/ath/ath10k/ptp.c b/drivers/net/wireless/ath/ath10k/ptp.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath10k/ptp.c
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: ISC
++/*
++ * ath10k PTP hardware clock -- expose TSF as /dev/ptpN
++ *
++ * ath10k accesses TSF via WMI firmware commands. Unlike register-based
++ * drivers (ath9k), each TSF read requires a round-trip to firmware,
++ * adding ~100-500us latency. This limits PTP precision but is still
++ * useful for coarse TSF alignment.
++ *
++ * The implementation stores a vdev_id for TSF access. PTP clock ops
++ * send synchronous WMI commands and wait for completion.
++ *
++ * TSF is in microseconds (802.11); PTP is in nanoseconds.
++ */
++
++#include <linux/ptp_clock_kernel.h>
++#include "core.h"
++#include "wmi-ops.h"
++#include "ptp.h"
++
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++
++/*
++ * Read TSF via WMI. Sends a stats request to firmware and waits for
++ * the response via completion. The WMI event handler must call
++ * ath10k_ptp_tsf_event() when the response arrives.
++ *
++ * Caller must hold ar->conf_mutex.
++ */
++static u64 ath10k_ptp_read_tsf(struct ath10k *ar)
++{
++	int ret;
++
++	if (ar->ptp_vdev_id < 0)
++		return 0;
++
++	reinit_completion(&ar->tsf_read_complete);
++
++	ret = ath10k_wmi_request_stats(ar, WMI_STAT_VDEV);
++	if (ret) {
++		ath10k_warn(ar, "PTP: WMI stats request failed: %d\n", ret);
++		return 0;
++	}
++
++	ret = wait_for_completion_timeout(&ar->tsf_read_complete,
++					  msecs_to_jiffies(500));
++	if (!ret) {
++		ath10k_warn(ar, "PTP: TSF read timed out\n");
++		return 0;
++	}
++
++	return ar->tsf_read_value;
++}
++
++static int ath10k_ptp_gettime64(struct ptp_clock_info *ptp,
++				struct timespec64 *ts)
++{
++	struct ath10k *ar = container_of(ptp, struct ath10k, ptp_info);
++	u64 tsf;
++
++	mutex_lock(&ar->conf_mutex);
++	tsf = ath10k_ptp_read_tsf(ar);
++	mutex_unlock(&ar->conf_mutex);
++
++	*ts = ns_to_timespec64((s64)tsf * NSEC_PER_USEC);
++	return 0;
++}
++
++static int ath10k_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
++{
++	struct ath10k *ar = container_of(ptp, struct ath10k, ptp_info);
++	struct ath10k_vif *arvif;
++	s64 delta_usec = div_s64(delta_ns, NSEC_PER_USEC);
++	u32 vdev_param, abs_delta;
++	int ret;
++
++	if (delta_usec == 0)
++		return 0;
++
++	if (delta_usec < 0) {
++		vdev_param = ar->wmi.vdev_param->dec_tsf;
++		abs_delta = (u32)(-delta_usec);
++	} else {
++		vdev_param = ar->wmi.vdev_param->inc_tsf;
++		abs_delta = (u32)delta_usec;
++	}
++
++	mutex_lock(&ar->conf_mutex);
++	if (ar->ptp_vdev_id < 0) {
++		mutex_unlock(&ar->conf_mutex);
++		return -ENODEV;
++	}
++
++	/* Find the vdev to apply the TSF offset. */
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (arvif->vdev_id == ar->ptp_vdev_id) {
++			ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id,
++							vdev_param, abs_delta);
++			if (ret && ret != -EOPNOTSUPP)
++				ath10k_warn(ar, "PTP: failed to set tsf offset %d: %d\n",
++					    abs_delta, ret);
++			break;
++		}
++	}
++	mutex_unlock(&ar->conf_mutex);
++
++	return 0;
++}
++
++static int ath10k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++{
++	/* Fixed crystal oscillator -- no hardware frequency tuning. */
++	return 0;
++}
++
++/* Called by WMI event handler when TSF stats arrive. */
++void ath10k_ptp_tsf_event(struct ath10k *ar, u64 tsf)
++{
++	ar->tsf_read_value = tsf;
++	complete(&ar->tsf_read_complete);
++}
++
++/*
++ * Start PTP clock with a specific vdev_id for TSF access.
++ * Called when the first vdev is created.
++ */
++void ath10k_ptp_start(struct ath10k *ar, int vdev_id)
++{
++	struct ptp_clock_info *info = &ar->ptp_info;
++
++	if (ar->ptp_clock)
++		return;
++
++	ar->ptp_vdev_id = vdev_id;
++
++	memset(info, 0, sizeof(*info));
++	info->owner = THIS_MODULE;
++	snprintf(info->name, sizeof(info->name), "ath10k-%s",
++		 wiphy_name(ar->hw->wiphy));
++	info->max_adj = 500000000;
++	info->gettime64 = ath10k_ptp_gettime64;
++	info->adjtime = ath10k_ptp_adjtime;
++	info->adjfine = ath10k_ptp_adjfine;
++
++	ar->ptp_clock = ptp_clock_register(info, ar->dev);
++	if (IS_ERR(ar->ptp_clock)) {
++		ath10k_err(ar, "PTP clock registration failed: %ld\n",
++			   PTR_ERR(ar->ptp_clock));
++		ar->ptp_clock = NULL;
++		return;
++	}
++
++	ath10k_info(ar, "registered PTP clock (ptp%d)\n",
++		    ptp_clock_index(ar->ptp_clock));
++}
++
++void ath10k_ptp_remove(struct ath10k *ar)
++{
++	if (ar->ptp_clock) {
++		ptp_clock_unregister(ar->ptp_clock);
++		ar->ptp_clock = NULL;
++		ar->ptp_vdev_id = -1;
++	}
++}
++
++void ath10k_ptp_init(struct ath10k *ar)
++{
++	ar->ptp_vdev_id = -1;
++	init_completion(&ar->tsf_read_complete);
++}
++
++#else /* !CONFIG_PTP_1588_CLOCK */
++
++void ath10k_ptp_init(struct ath10k *ar) {}
++void ath10k_ptp_start(struct ath10k *ar, int vdev_id) {}
++void ath10k_ptp_remove(struct ath10k *ar) {}
++void ath10k_ptp_tsf_event(struct ath10k *ar, u64 tsf) {}
++
++#endif /* CONFIG_PTP_1588_CLOCK */
+diff --git a/drivers/net/wireless/ath/ath10k/ptp.h b/drivers/net/wireless/ath/ath10k/ptp.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath10k/ptp.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: ISC */
++/*
++ * ath10k PTP hardware clock declarations.
++ *
++ * TSF access is via WMI firmware commands (higher latency than
++ * register-based drivers).
++ */
++
++#ifndef ATH10K_PTP_H
++#define ATH10K_PTP_H
++
++struct ath10k;
++
++void ath10k_ptp_init(struct ath10k *ar);
++void ath10k_ptp_start(struct ath10k *ar, int vdev_id);
++void ath10k_ptp_remove(struct ath10k *ar);
++
++/* Called from WMI event handler when TSF stats response arrives. */
++void ath10k_ptp_tsf_event(struct ath10k *ar, u64 tsf);
++
++#endif /* ATH10K_PTP_H */
