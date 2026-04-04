@@ -79,13 +79,25 @@
             tsfSync = package;
           }
         );
+
+        # ─── Upstream PTP patches (per-driver) ──────────────────────────
+        patchInfra = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+          import ./patches { inherit pkgs lib; }
+        );
+
+        patchTest = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+          import ./patches/test { inherit pkgs lib; }
+        );
       in
       {
         packages = {
           default = package;
           tsf-sync = package;
           kernel-module = kernelModule;
-        } // scripts // crossPackages // (microvmTests.packages or {});
+        } // scripts // crossPackages
+          // (microvmTests.packages or {})
+          // (patchInfra.packages or {})
+          // (patchTest.packages or {});
 
         checks = checks;
 

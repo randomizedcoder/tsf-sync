@@ -44,6 +44,7 @@ let
       radios ? 4,
       threshold ? 5000,
       syncMode ? 0,
+      extraPackages ? [],
       ...
     }:
     let
@@ -71,6 +72,9 @@ let
       # Kernel module built against THIS VM's kernel
       vmKernelPackages = overlayedPkgs.${constants.getKernelPackage arch};
       tsfPtpModule = vmKernelPackages.callPackage ../../../nix/kernel-module.nix {};
+
+      # PTP selftest binary (cross-compiled for target arch)
+      wifiPtpTest = overlayedPkgs.callPackage ../../../nix/wifi-ptp-test.nix {};
 
       hostname = "tsf-sync-${arch}-${variant}-vm";
       consolePorts = constants.consolePorts arch portOffset;
@@ -196,11 +200,12 @@ let
               # ─── Packages ──────────────────────────────────────────────────
               environment.systemPackages = [
                 tsfSyncForArch
+                wifiPtpTest
                 pkgs.linuxptp
                 pkgs.kmod
                 pkgs.iw
                 pkgs.ethtool
-              ];
+              ] ++ extraPackages;
 
               # ─── SSH for lifecycle tests ───────────────────────────────────
               services.openssh = {

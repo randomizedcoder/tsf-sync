@@ -184,4 +184,34 @@ in
       modinfo tsf_ptp.ko
     '';
   };
+
+  # Verify hot-path assembly: inline syscalls present, no libc PLT calls,
+  # SIMD instructions (PMADDUBSW, PSHUFB) in hex parser.
+  #
+  #   nix run .#check-asm
+  #   nix run .#check-asm -- --dump        # also print hot path disassembly
+  #   nix run .#check-asm -- --save /tmp/tsf.asm
+  #
+  check-asm = pkgs.writeShellApplication {
+    name = "tsf-sync-check-asm";
+    runtimeInputs = with pkgs; [ binutils-unwrapped python3 ];
+    text = ''
+      exec ${../scripts/check-asm.sh} "$@"
+    '';
+  };
+
+  # Criterion microbenchmarks: SIMD vs scalar hex parsing, inline vs libc
+  # syscall overhead, decimal formatting throughput.
+  #
+  #   nix run .#bench-hot-path
+  #   nix run .#bench-hot-path -- --save-baseline before
+  #   nix run .#bench-hot-path -- --baseline before
+  #
+  bench-hot-path = pkgs.writeShellApplication {
+    name = "tsf-sync-bench-hot-path";
+    runtimeInputs = [ ];
+    text = ''
+      exec cargo bench --bench hot_path "$@"
+    '';
+  };
 }

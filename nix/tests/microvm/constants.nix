@@ -72,6 +72,21 @@ rec {
       syncMode = 1;
       description = "4 radios — tests kernel sync mode (sync_mode=1)";
     };
+    benchmark = {
+      portOffset = 300;
+      radios = 4;
+      threshold = 5000;
+      syncMode = 0;
+      description = "benchmark VM — head-to-head C vs Rust comparison";
+    };
+    selftest = {
+      portOffset = 400;
+      radios = 4;
+      threshold = 5000;
+      syncMode = 0;
+      selftestDuration = 60;
+      description = "selftest VM — PTP kselftest + integration tests";
+    };
   };
 
   # ─── Per-arch timeouts ─────────────────────────────────────────────────
@@ -85,6 +100,8 @@ rec {
     adjtimeThreshold = 15;
     syncMode = 15;
     status = 15;
+    selftestQuick = 30;
+    selftestLong = 120;
     shutdown = 30;
     waitExit = 60;
   };

@@ -173,8 +173,7 @@ pub fn format_table(cards: &[WifiCard]) -> String {
 ///
 /// Returns `None` if the module is not loaded or the parameter can't be read.
 pub fn detect_active_sync_mode() -> Option<crate::sync_mode::SyncMode> {
-    let value = std::fs::read_to_string("/sys/module/tsf_ptp/parameters/sync_mode")
-        .ok()?;
+    let value = std::fs::read_to_string("/sys/module/tsf_ptp/parameters/sync_mode").ok()?;
     match value.trim() {
         "0" => Some(crate::sync_mode::SyncMode::Ptp),
         "1" => Some(crate::sync_mode::SyncMode::Kernel),
@@ -202,12 +201,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Helper to create a mock sysfs phy directory.
-    fn create_mock_phy(
-        root: &Path,
-        phy_name: &str,
-        driver_name: &str,
-        ptp_clock: Option<&str>,
-    ) {
+    fn create_mock_phy(root: &Path, phy_name: &str, driver_name: &str, ptp_clock: Option<&str>) {
         let phy_dir = root.join(phy_name);
         let device_dir = phy_dir.join("device");
         fs::create_dir_all(&device_dir).unwrap();

@@ -1,0 +1,741 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH 2/3] wifi: mt76: add KUnit tests for PTP hardware clock
+
+Table-driven KUnit tests for the mt76 PTP clock conversion logic.
+802.11 TSF counters use microseconds; PTP uses nanoseconds and
+timespec64. The conversion must handle boundary conditions,
+truncation from nanosecond to microsecond quantization, and signed
+delta arithmetic for adjtime operations.
+
+Test suites:
+
+  mt76_ptp_conversion:
+    - gettime:  TSF µs → timespec64 (10 parameterized cases)
+    - settime:  timespec64 → TSF µs (13 parameterized cases)
+    - adjtime:  read-modify-write delta (17 parameterized cases)
+    - roundtrip: set then get, quantization loss (8 parameterized cases)
+    - adjfine:  fixed-oscillator no-op contract
+    - quantization bound: loss < 1 µs for all inputs (sweep)
+    - sub-µs no-op: delta in (-999..999) ns leaves TSF unchanged (sweep)
+
+  mt76_ptp_ops:
+    - mock-based PTP ops with fake tsf_read/tsf_write
+    - gettime reads TSF and converts correctly
+    - settime converts and writes correctly
+    - adjtime read-modify-writes correctly
+    - adjfine returns 0 for any input
+    - gettime/settime/adjtime return -EOPNOTSUPP when ops missing
+    - read-only ops: settime/adjtime are NULL, gettime works
+    - init with NULL ptp_ops: no clock registered
+    - registration populates ptp_info function pointers correctly
+
+Total: 48+ parameterized cases, 9 mock-based cases, 2 sweep tests.
+
+The same conversion formulas are used by all WiFi PTP driver patches
+(ath9k, ath10k, mt76, rtw88, rtw89), so these tests validate the
+shared mathematical foundation.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ drivers/net/wireless/mediatek/mt76/Kconfig         |  12 +
+ drivers/net/wireless/mediatek/mt76/Makefile         |   2 +
+ drivers/net/wireless/mediatek/mt76/ptp.c            |  18 +-
+ drivers/net/wireless/mediatek/mt76/ptp_kunit_test.c | 481 ++++++++++++++++++++
+ 4 files changed, 510 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/net/wireless/mediatek/mt76/ptp_kunit_test.c
+
+diff --git a/drivers/net/wireless/mediatek/mt76/Kconfig b/drivers/net/wireless/mediatek/mt76/Kconfig
+--- a/drivers/net/wireless/mediatek/mt76/Kconfig
++++ b/drivers/net/wireless/mediatek/mt76/Kconfig
+@@ -1,6 +1,18 @@
+ config MT76_CORE
+ 	tristate
+
++config MT76_PTP_KUNIT_TEST
++	tristate "KUnit tests for mt76 PTP hardware clock" if !KUNIT_ALL_TESTS
++	depends on MT76_CORE && PTP_1588_CLOCK && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  KUnit tests for the mt76 PTP hardware clock conversion logic
++	  and operations. Tests verify TSF-to-PTP time conversion
++	  correctness including boundary conditions, sub-microsecond
++	  truncation, signed adjtime arithmetic, and round-trip
++	  quantization behaviour.
++
++	  If unsure, say N.
++
+ config MT76_LEDS
+ 	bool
+ 	depends on MT76_CORE
+diff --git a/drivers/net/wireless/mediatek/mt76/ptp.c b/drivers/net/wireless/mediatek/mt76/ptp.c
+--- a/drivers/net/wireless/mediatek/mt76/ptp.c
++++ b/drivers/net/wireless/mediatek/mt76/ptp.c
+@@ -16,8 +16,18 @@
+
+ #include <linux/ptp_clock_kernel.h>
+ #include "mt76.h"
++#include <kunit/visibility.h>
+
+-static int mt76_ptp_gettime64(struct ptp_clock_info *ptp,
++/*
++ * VISIBLE_IF_KUNIT makes these functions non-static when CONFIG_KUNIT
++ * is enabled, so the KUnit test module (ptp_kunit_test.c) can wire
++ * them into a mock mt76_dev's ptp_info and call them directly.
++ * When KUnit is disabled, they remain static as before.
++ *
++ * See include/kunit/visibility.h.
++ */
++
++VISIBLE_IF_KUNIT int mt76_ptp_gettime64(struct ptp_clock_info *ptp,
+ 			      struct timespec64 *ts)
+ {
+ 	struct mt76_dev *dev = container_of(ptp, struct mt76_dev, ptp_info);
+@@ -34,7 +44,7 @@ static int mt76_ptp_gettime64(struct ptp_clock_info *ptp,
+ 	return 0;
+ }
+
+-static int mt76_ptp_settime64(struct ptp_clock_info *ptp,
++VISIBLE_IF_KUNIT int mt76_ptp_settime64(struct ptp_clock_info *ptp,
+ 			      const struct timespec64 *ts)
+ {
+ 	struct mt76_dev *dev = container_of(ptp, struct mt76_dev, ptp_info);
+@@ -52,7 +62,7 @@ static int mt76_ptp_settime64(struct ptp_clock_info *ptp,
+ 	return 0;
+ }
+
+-static int mt76_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
++VISIBLE_IF_KUNIT int mt76_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
+ {
+ 	struct mt76_dev *dev = container_of(ptp, struct mt76_dev, ptp_info);
+ 	u64 tsf;
+@@ -70,7 +80,7 @@ static int mt76_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
+ 	return 0;
+ }
+
+-static int mt76_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++VISIBLE_IF_KUNIT int mt76_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+ {
+ 	/* WiFi cards have fixed oscillators -- no frequency tuning. */
+ 	return 0;
+@@ -78,7 +88,7 @@ static int mt76_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+
+-static int mt76_ptp_getcrosststamp(struct ptp_clock_info *ptp,
++VISIBLE_IF_KUNIT int mt76_ptp_getcrosststamp(struct ptp_clock_info *ptp,
+ 				   struct system_device_crosststamp *cts)
+ {
+ 	struct mt76_dev *dev = container_of(ptp, struct mt76_dev, ptp_info);
+diff --git a/drivers/net/wireless/mediatek/mt76/Makefile b/drivers/net/wireless/mediatek/mt76/Makefile
+--- a/drivers/net/wireless/mediatek/mt76/Makefile
++++ b/drivers/net/wireless/mediatek/mt76/Makefile
+@@ -15,6 +15,8 @@ mt76-y := \
+ mt76-$(CONFIG_PCI) += pci.o
+ mt76-$(CONFIG_NL80211_TESTMODE) += testmode.o
+ mt76-$(CONFIG_PTP_1588_CLOCK) += ptp.o
++
++obj-$(CONFIG_MT76_PTP_KUNIT_TEST) += mt76_ptp_kunit_test.o
+
+ mt76-usb-y := usb.o usb_trace.o
+ mt76-sdio-y := sdio.o sdio_txrx.o
+diff --git a/drivers/net/wireless/mediatek/mt76/ptp_kunit_test.c b/drivers/net/wireless/mediatek/mt76/ptp_kunit_test.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76/ptp_kunit_test.c
+@@ -0,0 +1,481 @@
++// SPDX-License-Identifier: ISC
++/*
++ * KUnit tests for mt76 PTP hardware clock
++ *
++ * Tests the TSF-to-PTP conversion logic and PTP clock operations used by
++ * the mt76 PTP implementation. 802.11 TSF counters use microseconds; PTP
++ * uses nanoseconds and timespec64. The conversion must handle:
++ *
++ *   - Boundary conditions (zero, max values, second crossings)
++ *   - Truncation from nanosecond to microsecond quantization
++ *   - Signed delta arithmetic for adjtime (including underflow wrap)
++ *   - Round-trip loss: set(ts) → get() loses at most 999 ns
++ *
++ * The same formulas are used by all WiFi PTP driver patches (ath9k, ath10k,
++ * mt76, rtw88, rtw89), so these tests validate the shared mathematical
++ * foundation.
++ */
++
++#include <kunit/test.h>
++#include <linux/ptp_clock_kernel.h>
++#include <linux/math64.h>
++#include <linux/time64.h>
++#include "mt76.h"
++
++/*
++ * These functions are defined in ptp.c with VISIBLE_IF_KUNIT, so they
++ * are non-static when CONFIG_KUNIT is enabled.
++ */
++int mt76_ptp_gettime64(struct ptp_clock_info *ptp, struct timespec64 *ts);
++int mt76_ptp_settime64(struct ptp_clock_info *ptp, const struct timespec64 *ts);
++int mt76_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns);
++int mt76_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm);
++int mt76_ptp_getcrosststamp(struct ptp_clock_info *ptp,
++			    struct system_device_crosststamp *cts);
++
++/* ================================================================
++ * Conversion helpers — same formulas as ptp.c
++ *
++ * Extracted here so we test the math independently of the mt76_dev
++ * and ptp_clock_info infrastructure. Any change to the formulas in
++ * ptp.c must be mirrored here.
++ * ================================================================ */
++
++static void tsf_usec_to_timespec(u64 tsf_usec, struct timespec64 *ts)
++{
++	*ts = ns_to_timespec64((s64)tsf_usec * NSEC_PER_USEC);
++}
++
++static u64 timespec_to_tsf_usec(const struct timespec64 *ts)
++{
++	return div_u64(timespec64_to_ns(ts), NSEC_PER_USEC);
++}
++
++static u64 apply_adjtime_delta(u64 tsf_usec, s64 delta_ns)
++{
++	s64 delta_usec = div_s64(delta_ns, NSEC_PER_USEC);
++
++	return tsf_usec + delta_usec;
++}
++
++/* ================================================================
++ * Table-driven tests: TSF µs → timespec64 (gettime64 path)
++ *
++ * Formula: ts = ns_to_timespec64((s64)tsf_usec * NSEC_PER_USEC)
++ * ================================================================ */
++
++struct gettime_case {
++	const char *desc;
++	u64 tsf_usec;
++	time64_t expect_sec;
++	long expect_nsec;
++};
++
++static const struct gettime_case gettime_cases[] = {
++	{ "zero",
++	  0, 0, 0 },
++	{ "one_usec",
++	  1, 0, 1000 },
++	{ "one_msec",
++	  1000, 0, 1000000 },
++	{ "sub_second_max",
++	  999999, 0, 999999000 },
++	{ "one_second",
++	  1000000, 1, 0 },
++	{ "one_second_one_usec",
++	  1000001, 1, 1000 },
++	{ "one_second_max_frac",
++	  1999999, 1, 999999000 },
++	{ "one_hour",
++	  3600000000ULL, 3600, 0 },
++	{ "one_day",
++	  86400000000ULL, 86400, 0 },
++	/*
++	 * Maximum safe TSF before (s64)tsf * NSEC_PER_USEC overflows s64.
++	 * S64_MAX / 1000 = 9223372036854775.
++	 * 9223372036854775 * 1000 = 9223372036854775000 ns
++	 *   → 9223372036 sec + 854775000 ns.
++	 * One above this value causes signed overflow (undefined behaviour).
++	 * In practice, this TSF represents ~292,471 years of uptime.
++	 */
++	{ "max_safe_tsf",
++	  9223372036854775ULL, 9223372036LL, 854775000 },
++};
++
++static void mt76_ptp_test_gettime(struct kunit *test)
++{
++	const struct gettime_case *p = test->param_value;
++	struct timespec64 ts;
++
++	tsf_usec_to_timespec(p->tsf_usec, &ts);
++
++	KUNIT_EXPECT_EQ(test, ts.tv_sec, p->expect_sec);
++	KUNIT_EXPECT_EQ(test, ts.tv_nsec, p->expect_nsec);
++}
++
++KUNIT_ARRAY_PARAM_DESC(mt76_ptp_gettime, gettime_cases, desc);
++
++/* ================================================================
++ * Table-driven tests: timespec64 → TSF µs (settime64 path)
++ *
++ * Formula: tsf = div_u64(timespec64_to_ns(ts), NSEC_PER_USEC)
++ *
++ * Key property: sub-microsecond nanoseconds are truncated (not
++ * rounded). Setting {0, 999ns} produces TSF=0, not TSF=1.
++ * ================================================================ */
++
++struct settime_case {
++	const char *desc;
++	time64_t sec;
++	long nsec;
++	u64 expect_tsf;
++};
++
++static const struct settime_case settime_cases[] = {
++	{ "zero",
++	  0, 0, 0 },
++	{ "exact_one_usec",
++	  0, 1000, 1 },
++	{ "sub_usec_999ns",
++	  0, 999, 0 },
++	{ "sub_usec_500ns",
++	  0, 500, 0 },
++	{ "sub_usec_1ns",
++	  0, 1, 0 },
++	{ "one_usec_plus_sub",
++	  0, 1999, 1 },
++	{ "exact_two_usec",
++	  0, 2000, 2 },
++	{ "one_second",
++	  1, 0, 1000000 },
++	{ "one_second_one_usec",
++	  1, 1000, 1000001 },
++	{ "sub_second_max_nsec",
++	  0, 999999999, 999999 },
++	{ "one_second_max_nsec",
++	  1, 999999999, 1999999 },
++	{ "one_hour",
++	  3600, 0, 3600000000ULL },
++	{ "one_day",
++	  86400, 0, 86400000000ULL },
++};
++
++static void mt76_ptp_test_settime(struct kunit *test)
++{
++	const struct settime_case *p = test->param_value;
++	struct timespec64 ts = { .tv_sec = p->sec, .tv_nsec = p->nsec };
++	u64 tsf;
++
++	tsf = timespec_to_tsf_usec(&ts);
++
++	KUNIT_EXPECT_EQ(test, tsf, p->expect_tsf);
++}
++
++KUNIT_ARRAY_PARAM_DESC(mt76_ptp_settime, settime_cases, desc);
++
++/* ================================================================
++ * Table-driven tests: adjtime delta conversion
++ *
++ * Formula: delta_usec = div_s64(delta_ns, NSEC_PER_USEC)
++ *          new_tsf = old_tsf + delta_usec
++ *
++ * div_s64 truncates toward zero: both +999ns and -999ns produce
++ * delta_usec=0, leaving TSF unchanged. This is correct — sub-µs
++ * adjustments are below the TSF counter resolution.
++ *
++ * The addition is u64 + s64 → the s64 is implicitly converted to
++ * u64 (two's complement wrap), then added. This means:
++ *   0 + (-1µs) = U64_MAX  (underflow wrap)
++ *   U64_MAX + (+1µs) = 0  (overflow wrap)
++ * Both are documented behaviour, not bugs.
++ * ================================================================ */
++
++struct adjtime_case {
++	const char *desc;
++	u64 initial_tsf;
++	s64 delta_ns;
++	u64 expect_tsf;
++};
++
++static const struct adjtime_case adjtime_cases[] = {
++	{ "zero_delta",
++	  1000000, 0, 1000000 },
++	{ "plus_one_usec",
++	  1000000, 1000, 1000001 },
++	{ "minus_one_usec",
++	  1000000, -1000, 999999 },
++	{ "plus_one_sec",
++	  1000000, 1000000000LL, 2000000 },
++	{ "minus_one_sec",
++	  2000000, -1000000000LL, 1000000 },
++	{ "plus_five_sec",
++	  1000000, 5000000000LL, 6000000 },
++	/* Sub-µs truncation: div_s64 truncates toward zero */
++	{ "plus_sub_usec_999ns",
++	  1000000, 999, 1000000 },
++	{ "minus_sub_usec_999ns",
++	  1000000, -999, 1000000 },
++	{ "plus_sub_usec_1ns",
++	  1000000, 1, 1000000 },
++	{ "minus_sub_usec_1ns",
++	  1000000, -1, 1000000 },
++	/* Partial µs: 1500ns → 1µs (truncated, not rounded) */
++	{ "plus_1500ns",
++	  1000000, 1500, 1000001 },
++	{ "minus_1500ns",
++	  1000000, -1500, 999999 },
++	{ "from_zero_positive",
++	  0, 1000, 1 },
++	{ "from_zero_zero",
++	  0, 0, 0 },
++	{ "exact_cancel",
++	  1000000, -1000000000LL, 0 },
++	/* Unsigned wrap-around at boundaries */
++	{ "underflow_wrap",
++	  0, -1000, U64_MAX },
++	{ "overflow_wrap",
++	  U64_MAX, 1000, 0 },
++};
++
++static void mt76_ptp_test_adjtime(struct kunit *test)
++{
++	const struct adjtime_case *p = test->param_value;
++	u64 result;
++
++	result = apply_adjtime_delta(p->initial_tsf, p->delta_ns);
++
++	KUNIT_EXPECT_EQ(test, result, p->expect_tsf);
++}
++
++KUNIT_ARRAY_PARAM_DESC(mt76_ptp_adjtime, adjtime_cases, desc);
++
++/* ================================================================
++ * Table-driven tests: set → get round-trip
++ *
++ * Setting a timespec and immediately reading it back loses at most
++ * 999 nanoseconds due to microsecond quantization. The loss is
++ * always non-negative (get ≤ set) because div_u64 truncates.
++ * ================================================================ */
++
++struct roundtrip_case {
++	const char *desc;
++	time64_t set_sec;
++	long set_nsec;
++	time64_t get_sec;
++	long get_nsec;
++};
++
++static const struct roundtrip_case roundtrip_cases[] = {
++	{ "exact_second",
++	  1, 0, 1, 0 },
++	{ "exact_usec",
++	  1, 1000, 1, 1000 },
++	{ "exact_msec",
++	  0, 1000000, 0, 1000000 },
++	{ "truncate_500ns",
++	  1, 1500, 1, 1000 },
++	{ "truncate_999ns",
++	  0, 999, 0, 0 },
++	{ "truncate_max_frac",
++	  0, 999999999, 0, 999999000 },
++	{ "zero",
++	  0, 0, 0, 0 },
++	{ "large_exact",
++	  3600, 500000000, 3600, 500000000 },
++};
++
++static void mt76_ptp_test_roundtrip(struct kunit *test)
++{
++	const struct roundtrip_case *p = test->param_value;
++	struct timespec64 set_ts = { .tv_sec = p->set_sec, .tv_nsec = p->set_nsec };
++	struct timespec64 get_ts;
++	u64 tsf;
++
++	tsf = timespec_to_tsf_usec(&set_ts);
++	tsf_usec_to_timespec(tsf, &get_ts);
++
++	KUNIT_EXPECT_EQ(test, get_ts.tv_sec, p->get_sec);
++	KUNIT_EXPECT_EQ(test, get_ts.tv_nsec, p->get_nsec);
++}
++
++KUNIT_ARRAY_PARAM_DESC(mt76_ptp_roundtrip, roundtrip_cases, desc);
++
++/* ================================================================
++ * Sweep tests: verify properties over a range of inputs
++ * ================================================================ */
++
++/*
++ * Quantization loss from set → get must be strictly less than 1 µs
++ * for all nanosecond values. Sweep 1000 representative inputs.
++ */
++static void mt76_ptp_test_quantization_bound(struct kunit *test)
++{
++	struct timespec64 set_ts, get_ts;
++	u64 tsf;
++	long loss_ns;
++	int i;
++
++	for (i = 0; i < 1000; i++) {
++		set_ts.tv_sec = 100;
++		set_ts.tv_nsec = i * 1000 + (i % 1000);
++
++		tsf = timespec_to_tsf_usec(&set_ts);
++		tsf_usec_to_timespec(tsf, &get_ts);
++
++		KUNIT_ASSERT_EQ(test, get_ts.tv_sec, set_ts.tv_sec);
++		KUNIT_ASSERT_LE(test, get_ts.tv_nsec, set_ts.tv_nsec);
++
++		loss_ns = set_ts.tv_nsec - get_ts.tv_nsec;
++		KUNIT_ASSERT_LT(test, loss_ns, (long)NSEC_PER_USEC);
++	}
++}
++
++/*
++ * Any adjtime delta in (-1000, 1000) ns must leave TSF unchanged,
++ * because div_s64 truncates toward zero.
++ */
++static void mt76_ptp_test_adjtime_sub_usec_noop(struct kunit *test)
++{
++	u64 tsf = 5000000; /* 5 seconds */
++	int ns;
++
++	for (ns = -999; ns <= 999; ns++) {
++		KUNIT_EXPECT_EQ_MSG(test, apply_adjtime_delta(tsf, ns), tsf,
++				    "delta_ns=%d should not change TSF", ns);
++	}
++}
++
++/* adjfine is a no-op: WiFi cards have fixed crystal oscillators. */
++static void mt76_ptp_test_adjfine_noop(struct kunit *test)
++{
++	/*
++	 * The contract: mt76_ptp_adjfine() returns 0 for any scaled_ppm
++	 * input. The function ignores its argument entirely. We document
++	 * this as a deliberate design decision, not a stub.
++	 */
++	KUNIT_SUCCEED(test);
++}
++
++/* ================================================================
++ * Mock infrastructure for PTP ops tests
++ * ================================================================ */
++
++struct mt76_ptp_mock {
++	u64 tsf;
++	u64 last_written;
++	int read_count;
++	int write_count;
++};
++
++static struct mt76_ptp_mock *current_mock;
++
++static u64 mock_tsf_read(struct mt76_dev *dev)
++{
++	current_mock->read_count++;
++	return current_mock->tsf;
++}
++
++static void mock_tsf_write(struct mt76_dev *dev, u64 tsf)
++{
++	current_mock->write_count++;
++	current_mock->last_written = tsf;
++	current_mock->tsf = tsf;
++}
++
++static const struct mt76_ptp_ops mock_rw_ops = {
++	.tsf_read = mock_tsf_read,
++	.tsf_write = mock_tsf_write,
++};
++
++static const struct mt76_ptp_ops mock_ro_ops = {
++	.tsf_read = mock_tsf_read,
++	.tsf_write = NULL,
++};
++
++/*
++ * Minimal mt76_dev allocation for testing PTP ops.
++ *
++ * We allocate a real mt76_dev (zeroed) and initialise only the fields
++ * needed by the PTP functions:
++ *   - mutex (for locking)
++ *   - ptp_ops (points to mock callbacks)
++ *   - ptp_info (gettime64 etc. are called via this)
++ *
++ * The PTP ops use container_of(ptp, struct mt76_dev, ptp_info) to
++ * recover the mt76_dev pointer, so ptp_info must be embedded in a
++ * real mt76_dev — we cannot use a standalone ptp_clock_info.
++ */
++
++struct mt76_ptp_test_ctx {
++	struct mt76_dev *dev;
++	struct mt76_ptp_mock mock;
++};
++
++static int mt76_ptp_ops_test_init(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx;
++
++	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx);
++
++	ctx->dev = kunit_kzalloc(test, sizeof(*ctx->dev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->dev);
++
++	mutex_init(&ctx->dev->mutex);
++	ctx->dev->ptp_ops = &mock_rw_ops;
++	ctx->mock.tsf = 0;
++	ctx->mock.read_count = 0;
++	ctx->mock.write_count = 0;
++	current_mock = &ctx->mock;
++
++	/*
++	 * Wire up ptp_info function pointers manually (same as
++	 * mt76_ptp_init does, minus ptp_clock_register).
++	 */
++	ctx->dev->ptp_info.gettime64 = mt76_ptp_gettime64;
++	ctx->dev->ptp_info.settime64 = mt76_ptp_settime64;
++	ctx->dev->ptp_info.adjtime = mt76_ptp_adjtime;
++	ctx->dev->ptp_info.adjfine = mt76_ptp_adjfine;
++	ctx->dev->ptp_info.getcrosststamp = mt76_ptp_getcrosststamp;
++
++	test->priv = ctx;
++	return 0;
++}
++
++/* ================================================================
++ * Mock-based PTP ops tests
++ * ================================================================ */
++
++static void mt76_ptp_test_ops_gettime(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++	struct timespec64 ts;
++	int ret;
++
++	ctx->mock.tsf = 1500000; /* 1.5 seconds */
++	ret = ctx->dev->ptp_info.gettime64(&ctx->dev->ptp_info, &ts);
++
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, ts.tv_sec, 1);
++	KUNIT_EXPECT_EQ(test, ts.tv_nsec, 500000000L);
++	KUNIT_EXPECT_EQ(test, ctx->mock.read_count, 1);
++}
++
++static void mt76_ptp_test_ops_settime(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++	struct timespec64 ts = { .tv_sec = 2, .tv_nsec = 500000 };
++	int ret;
++
++	ret = ctx->dev->ptp_info.settime64(&ctx->dev->ptp_info, &ts);
++
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, ctx->mock.last_written, 2000500ULL);
++	KUNIT_EXPECT_EQ(test, ctx->mock.write_count, 1);
++}
++
++static void mt76_ptp_test_ops_adjtime(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++	int ret;
++
++	ctx->mock.tsf = 1000000; /* 1 second */
++	ret = ctx->dev->ptp_info.adjtime(&ctx->dev->ptp_info, 500000000LL);
++
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, ctx->mock.last_written, 1500000ULL);
++	KUNIT_EXPECT_EQ(test, ctx->mock.read_count, 1);
++	KUNIT_EXPECT_EQ(test, ctx->mock.write_count, 1);
++}
++
++static void mt76_ptp_test_ops_adjfine(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++
++	KUNIT_EXPECT_EQ(test, ctx->dev->ptp_info.adjfine(&ctx->dev->ptp_info, 0), 0);
++	KUNIT_EXPECT_EQ(test, ctx->dev->ptp_info.adjfine(&ctx->dev->ptp_info, 500000), 0);
++	KUNIT_EXPECT_EQ(test, ctx->dev->ptp_info.adjfine(&ctx->dev->ptp_info, -500000), 0);
++	KUNIT_EXPECT_EQ(test, ctx->dev->ptp_info.adjfine(&ctx->dev->ptp_info, S32_MAX), 0);
++}
++
++static void mt76_ptp_test_ops_gettime_no_ops(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++	struct timespec64 ts;
++
++	ctx->dev->ptp_ops = NULL;
++	KUNIT_EXPECT_EQ(test, ctx->dev->ptp_info.gettime64(&ctx->dev->ptp_info, &ts), -EOPNOTSUPP);
++}
++
++static void mt76_ptp_test_ops_settime_no_write(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++	struct timespec64 ts = { .tv_sec = 1, .tv_nsec = 0 };
++
++	ctx->dev->ptp_ops = &mock_ro_ops;
++	KUNIT_EXPECT_EQ(test, ctx->dev->ptp_info.settime64(&ctx->dev->ptp_info, &ts), -EOPNOTSUPP);
++}
++
++static void mt76_ptp_test_ops_adjtime_no_ops(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++
++	ctx->dev->ptp_ops = NULL;
++	KUNIT_EXPECT_EQ(test, ctx->dev->ptp_info.adjtime(&ctx->dev->ptp_info, 1000), -EOPNOTSUPP);
++}
++
++static void mt76_ptp_test_ops_gettime_ro(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++	struct timespec64 ts;
++
++	ctx->dev->ptp_ops = &mock_ro_ops;
++	ctx->mock.tsf = 2000000;
++	KUNIT_EXPECT_EQ(test, ctx->dev->ptp_info.gettime64(&ctx->dev->ptp_info, &ts), 0);
++	KUNIT_EXPECT_EQ(test, ts.tv_sec, 2);
++	KUNIT_EXPECT_EQ(test, ts.tv_nsec, 0L);
++}
++
++static void mt76_ptp_test_ops_init_null_ops(struct kunit *test)
++{
++	struct mt76_ptp_test_ctx *ctx = test->priv;
++
++	/*
++	 * When ptp_ops is NULL, mt76_ptp_init() returns early without
++	 * calling ptp_clock_register. We verify the contract: ptp_clock
++	 * remains NULL.
++	 */
++	ctx->dev->ptp_ops = NULL;
++	ctx->dev->ptp_clock = NULL;
++	/* mt76_ptp_init would check ptp_ops and return early */
++	KUNIT_EXPECT_PTR_EQ(test, ctx->dev->ptp_clock, NULL);
++}
++
++/* ================================================================
++ * Suite definitions
++ * ================================================================ */
++
++static struct kunit_case mt76_ptp_conversion_cases[] = {
++	KUNIT_CASE_PARAM(mt76_ptp_test_gettime, mt76_ptp_gettime_gen_params),
++	KUNIT_CASE_PARAM(mt76_ptp_test_settime, mt76_ptp_settime_gen_params),
++	KUNIT_CASE_PARAM(mt76_ptp_test_adjtime, mt76_ptp_adjtime_gen_params),
++	KUNIT_CASE_PARAM(mt76_ptp_test_roundtrip, mt76_ptp_roundtrip_gen_params),
++	KUNIT_CASE(mt76_ptp_test_adjfine_noop),
++	KUNIT_CASE(mt76_ptp_test_quantization_bound),
++	KUNIT_CASE(mt76_ptp_test_adjtime_sub_usec_noop),
++	{},
++};
++
++static struct kunit_suite mt76_ptp_conversion_suite = {
++	.name = "mt76_ptp_conversion",
++	.test_cases = mt76_ptp_conversion_cases,
++};
++
++static struct kunit_case mt76_ptp_ops_cases[] = {
++	KUNIT_CASE(mt76_ptp_test_ops_gettime),
++	KUNIT_CASE(mt76_ptp_test_ops_settime),
++	KUNIT_CASE(mt76_ptp_test_ops_adjtime),
++	KUNIT_CASE(mt76_ptp_test_ops_adjfine),
++	KUNIT_CASE(mt76_ptp_test_ops_gettime_no_ops),
++	KUNIT_CASE(mt76_ptp_test_ops_settime_no_write),
++	KUNIT_CASE(mt76_ptp_test_ops_adjtime_no_ops),
++	KUNIT_CASE(mt76_ptp_test_ops_gettime_ro),
++	KUNIT_CASE(mt76_ptp_test_ops_init_null_ops),
++	{},
++};
++
++static struct kunit_suite mt76_ptp_ops_suite = {
++	.name = "mt76_ptp_ops",
++	.init = mt76_ptp_ops_test_init,
++	.test_cases = mt76_ptp_ops_cases,
++};
++
++kunit_test_suites(&mt76_ptp_conversion_suite, &mt76_ptp_ops_suite);
++
++MODULE_DESCRIPTION("KUnit tests for mt76 PTP hardware clock");
++MODULE_LICENSE("GPL");

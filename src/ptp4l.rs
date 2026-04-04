@@ -8,7 +8,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum SyncError {
     #[error("failed to start {name}: {source}")]
-    Start { name: String, source: std::io::Error },
+    Start {
+        name: String,
+        source: std::io::Error,
+    },
     #[error("{0} not found — is linuxptp installed?")]
     NotFound(String),
     #[error("{name} exited with status {code}")]
@@ -100,7 +103,11 @@ impl SyncProcess {
             thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        tracing::warn!(pid, "{} did not stop gracefully, sending SIGKILL", self.name);
+        tracing::warn!(
+            pid,
+            "{} did not stop gracefully, sending SIGKILL",
+            self.name
+        );
         self.child.kill().map_err(|e| SyncError::Stop {
             name: self.name.clone(),
             reason: e.to_string(),
@@ -195,10 +202,7 @@ mod tests {
     #[test]
     fn test_phc2sys_bin_from_full_path() {
         let p = phc2sys_bin_from("/nix/store/abc-linuxptp-4.4/bin/ptp4l");
-        assert_eq!(
-            p,
-            PathBuf::from("/nix/store/abc-linuxptp-4.4/bin/phc2sys")
-        );
+        assert_eq!(p, PathBuf::from("/nix/store/abc-linuxptp-4.4/bin/phc2sys"));
     }
 
     #[test]

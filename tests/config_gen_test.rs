@@ -55,15 +55,13 @@ fn test_auto_prefers_intel() {
 
 #[test]
 fn test_no_ptp_cards_error() {
-    let cards = vec![
-        WifiCard {
-            phy: "phy0".to_string(),
-            driver: "brcmfmac".to_string(),
-            ptp_clock: None,
-            ptp_source: PtpSource::None,
-            can_set_tsf: false,
-        },
-    ];
+    let cards = vec![WifiCard {
+        phy: "phy0".to_string(),
+        driver: "brcmfmac".to_string(),
+        ptp_clock: None,
+        ptp_source: PtpSource::None,
+        can_set_tsf: false,
+    }];
 
     let err = config_gen::generate_config(&cards, "auto").unwrap_err();
     assert!(matches!(err, ConfigError::NoPtpClocks));

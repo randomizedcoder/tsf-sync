@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH] wifi: ath11k: add PTP hardware clock for TSF synchronization
+
+Register a PTP hardware clock (/dev/ptpN) for each ath11k radio (pdev),
+exposing the 802.11 TSF timer to the Linux PTP subsystem.
+
+ath11k accesses TSF via WMI firmware commands:
+  adjtime   -> WMI_VDEV_PARAM_TSF_INCREMENT (ns converted to us)
+  adjfine   -> no-op (fixed crystal, no frequency trim)
+  gettime64 -> -EOPNOTSUPP (no synchronous TSF read path)
+  settime64 -> -EOPNOTSUPP
+
+The PTP clock is registered per-pdev (struct ath11k) during
+ath11k_core_pdev_create and unregistered during ath11k_core_pdev_destroy.
+adjtime finds the first active vdev on the radio to issue the WMI
+command.
+
+Covers: QCA6390, QCN9074, WCN6855, IPQ8074.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ 6 files changed, 180 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/wireless/ath/ath11k/ptp.c
+ create mode 100644 drivers/net/wireless/ath/ath11k/ptp.h
+
+diff --git a/drivers/net/wireless/ath/ath11k/Kconfig b/drivers/net/wireless/ath/ath11k/Kconfig
+--- a/drivers/net/wireless/ath/ath11k/Kconfig
++++ b/drivers/net/wireless/ath/ath11k/Kconfig
+@@ -5,6 +5,7 @@
+ 	select CRYPTO_MICHAEL_MIC
+ 	select ATH_COMMON
+ 	select QCOM_QMI_HELPERS
++	select PTP_1588_CLOCK_OPTIONAL
+ 	help
+ 	  This module adds support for Qualcomm Technologies 802.11ax family of
+ 	  chipsets.
+
+diff --git a/drivers/net/wireless/ath/ath11k/Makefile b/drivers/net/wireless/ath/ath11k/Makefile
+--- a/drivers/net/wireless/ath/ath11k/Makefile
++++ b/drivers/net/wireless/ath/ath11k/Makefile
+@@ -27,6 +27,7 @@
+ ath11k-$(CONFIG_THERMAL) += thermal.o
+ ath11k-$(CONFIG_ATH11K_SPECTRAL) += spectral.o
+ ath11k-$(CONFIG_PM) += wow.o
++ath11k-$(CONFIG_PTP_1588_CLOCK) += ptp.o
+ 
+ obj-$(CONFIG_ATH11K_AHB) += ath11k_ahb.o
+ ath11k_ahb-y += ahb.o
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -17,6 +17,7 @@
+ #include <linux/average.h>
+ #include <linux/firmware.h>
+ 
++#include <linux/ptp_clock_kernel.h>
+ #include "qmi.h"
+ #include "htc.h"
+ #include "wmi.h"
+@@ -785,6 +786,17 @@
+ 	/* protected by conf_mutex */
+ 	bool ps_state_enable;
+ 	bool ps_timekeeper_enable;
++
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++	/* PTP hardware clock (per-radio).
++	 * Protected by conf_mutex when accessing ptp_vdev_id.
++	 */
++	struct ptp_clock *ptp_clock;
++	struct ptp_clock_info ptp_info;
++	int ptp_vdev_id;
++	bool ptp_registered;
++#endif
++
+ 	s8 max_allowed_tx_power;
+ };
+ 
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -11,6 +11,7 @@
+ #include <linux/of.h>
+ 
+ #include "core.h"
++#include "ptp.h"
+ #include "dp_tx.h"
+ #include "dp_rx.h"
+ #include "debug.h"
+@@ -1622,7 +1623,7 @@
+ 
+ static int ath11k_core_pdev_create(struct ath11k_base *ab)
+ {
+-	int ret;
++	int ret, i;
+ 
+ 	ret = ath11k_debugfs_pdev_create(ab);
+ 	if (ret) {
+@@ -1655,8 +1656,18 @@
+ 		goto err_thermal_unregister;
+ 	}
+ 
++	for (i = 0; i < ab->num_radios; i++) {
++		ret = ath11k_ptp_init(&ab->pdevs[i].ar);
++		if (ret) {
++			ath11k_err(ab, "failed to init PTP for pdev %d: %d\n", i, ret);
++			goto err_spectral_unregister;
++		}
++	}
++
+ 	return 0;
+ 
++err_spectral_unregister:
++	ath11k_spectral_deinit(ab);
+ err_thermal_unregister:
+ 	ath11k_thermal_unregister(ab);
+ err_mac_unregister:
+@@ -1671,6 +1682,11 @@
+ 
+ static void ath11k_core_pdev_destroy(struct ath11k_base *ab)
+ {
++	int i;
++
++	for (i = 0; i < ab->num_radios; i++)
++		ath11k_ptp_remove(&ab->pdevs[i].ar);
++
+ 	ath11k_spectral_deinit(ab);
+ 	ath11k_thermal_unregister(ab);
+ 	ath11k_mac_unregister(ab);
+
+diff --git a/drivers/net/wireless/ath/ath11k/ptp.c b/drivers/net/wireless/ath/ath11k/ptp.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/ptp.c
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * ath11k PTP hardware clock -- expose TSF as /dev/ptpN
++ *
++ * TSF access is via WMI firmware commands.  Each radio (pdev) gets its
++ * own PTP clock instance.
++ *
++ * adjtime  -> WMI_VDEV_PARAM_TSF_INCREMENT (ns converted to us)
++ * adjfine  -> no-op (fixed crystal)
++ * gettime64 / settime64 -> -EOPNOTSUPP (no synchronous WMI path)
++ */
++
++#include <linux/ptp_clock_kernel.h>
++#include "core.h"
++#include "wmi.h"
++#include "ptp.h"
++
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++
++/* Find the first active vdev id on this radio, or -1 if none. */
++static int ath11k_ptp_find_vdev(struct ath11k *ar)
++{
++	struct ath11k_vif *arvif;
++
++	lockdep_assert_held(&ar->conf_mutex);
++
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (arvif->is_started)
++			return arvif->vdev_id;
++	}
++
++	return -1;
++}
++
++static int ath11k_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
++{
++	struct ath11k *ar = container_of(ptp, struct ath11k, ptp_info);
++	s64 delta_us = div_s64(delta_ns, NSEC_PER_USEC);
++	int vdev_id;
++	int ret;
++
++	mutex_lock(&ar->conf_mutex);
++	vdev_id = ath11k_ptp_find_vdev(ar);
++	if (vdev_id < 0) {
++		mutex_unlock(&ar->conf_mutex);
++		return -ENODEV;
++	}
++
++	ret = ath11k_wmi_vdev_set_param_cmd(ar, vdev_id,
++					     WMI_VDEV_PARAM_TSF_INCREMENT,
++					     (u32)delta_us);
++	mutex_unlock(&ar->conf_mutex);
++
++	if (ret)
++		ath11k_warn(ar->ab, "PTP adjtime WMI failed: %d\n", ret);
++
++	return ret;
++}
++
++static int ath11k_ptp_gettime64(struct ptp_clock_info *ptp,
++				struct timespec64 *ts)
++{
++	return -EOPNOTSUPP;
++}
++
++static int ath11k_ptp_settime64(struct ptp_clock_info *ptp,
++				const struct timespec64 *ts)
++{
++	return -EOPNOTSUPP;
++}
++
++static int ath11k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++{
++	return 0;
++}
++
++int ath11k_ptp_init(struct ath11k *ar)
++{
++	struct ptp_clock_info *info = &ar->ptp_info;
++
++	ar->ptp_vdev_id = -1;
++	ar->ptp_registered = false;
++
++	memset(info, 0, sizeof(*info));
++	info->owner = THIS_MODULE;
++	snprintf(info->name, sizeof(info->name), "ath11k-%s",
++		 wiphy_name(ar->hw->wiphy));
++	info->max_adj = 500000000;
++	info->adjtime = ath11k_ptp_adjtime;
++	info->gettime64 = ath11k_ptp_gettime64;
++	info->settime64 = ath11k_ptp_settime64;
++	info->adjfine = ath11k_ptp_adjfine;
++
++	ar->ptp_clock = ptp_clock_register(info, ar->ab->dev);
++	if (IS_ERR(ar->ptp_clock)) {
++		ath11k_err(ar->ab, "PTP clock register failed: %ld\n",
++			   PTR_ERR(ar->ptp_clock));
++		ar->ptp_clock = NULL;
++		return -EINVAL;
++	}
++
++	ar->ptp_registered = true;
++	ath11k_info(ar->ab, "registered PTP clock (ptp%d)\n",
++		    ptp_clock_index(ar->ptp_clock));
++
++	return 0;
++}
++
++void ath11k_ptp_remove(struct ath11k *ar)
++{
++	if (ar->ptp_clock) {
++		ptp_clock_unregister(ar->ptp_clock);
++		ar->ptp_clock = NULL;
++		ar->ptp_registered = false;
++		ar->ptp_vdev_id = -1;
++	}
++}
++
++#else /* !CONFIG_PTP_1588_CLOCK */
++
++int ath11k_ptp_init(struct ath11k *ar)
++{
++	return 0;
++}
++
++void ath11k_ptp_remove(struct ath11k *ar) {}
++
++#endif /* CONFIG_PTP_1588_CLOCK */
+diff --git a/drivers/net/wireless/ath/ath11k/ptp.h b/drivers/net/wireless/ath/ath11k/ptp.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/ptp.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * ath11k PTP hardware clock declarations.
++ *
++ * TSF access is via WMI firmware commands.  adjtime applies a TSF
++ * increment via WMI_VDEV_PARAM_TSF_INCREMENT; gettime64/settime64
++ * return -EOPNOTSUPP (no synchronous WMI read path).
++ */
++
++#ifndef ATH11K_PTP_H
++#define ATH11K_PTP_H
++
++struct ath11k;
++
++/* Register / unregister PTP clock for one radio. */
++int ath11k_ptp_init(struct ath11k *ar);
++void ath11k_ptp_remove(struct ath11k *ar);
++
++/* ptp_vdev_id is set internally via ath11k_ptp_find_vdev(). */
++
++#endif /* ATH11K_PTP_H */

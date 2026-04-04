@@ -62,7 +62,11 @@ pub fn start(
         c.can_set_tsf && c.ptp_clock.is_none() && c.ptp_source == discovery::PtpSource::None
     });
 
-    let primary_for_module = if primary != "auto" { Some(primary) } else { None };
+    let primary_for_module = if primary != "auto" {
+        Some(primary)
+    } else {
+        None
+    };
 
     if needs_module {
         tracing::info!("loading tsf-ptp kernel module (mode: {})", sync_mode);
@@ -137,26 +141,27 @@ pub fn start(
             let threshold = adjtime_threshold_ns as i64;
             let interval = Duration::from_millis(sync_interval_ms as u64);
 
-            let handle = std::thread::spawn(move || {
-                match crate::iouring_sync::IoUringSyncer::new(
-                    primary_index, threshold, interval,
-                ) {
-                    Ok(syncer) => syncer.run(r),
-                    Err(e) => tracing::error!("failed to create io_uring syncer: {}", e),
-                }
-            });
+            let handle =
+                std::thread::spawn(move || {
+                    match crate::iouring_sync::IoUringSyncer::new(
+                        primary_index,
+                        threshold,
+                        interval,
+                    ) {
+                        Ok(syncer) => syncer.run(r),
+                        Err(e) => tracing::error!("failed to create io_uring syncer: {}", e),
+                    }
+                });
 
             tracing::info!("io_uring sync thread started");
             Ok(SyncState::IoUring { handle, running })
         }
 
         #[cfg(not(feature = "iouring"))]
-        SyncMode::Iouring => {
-            Err(DaemonError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "iouring sync mode requires --features iouring",
-            )))
-        }
+        SyncMode::Iouring => Err(DaemonError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "iouring sync mode requires --features iouring",
+        ))),
     }
 }
 
@@ -256,8 +261,18 @@ pub fn run_daemon(
         r.store(false, Ordering::SeqCst);
     });
 
-    let mut state = start(primary, linuxptp_bin, adjtime_threshold_ns, sync_mode, sync_interval_ms)?;
-    tracing::info!("daemon started (mode: {}), monitoring every {:?}", sync_mode, interval);
+    let mut state = start(
+        primary,
+        linuxptp_bin,
+        adjtime_threshold_ns,
+        sync_mode,
+        sync_interval_ms,
+    )?;
+    tracing::info!(
+        "daemon started (mode: {}), monitoring every {:?}",
+        sync_mode,
+        interval
+    );
 
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(interval);
@@ -318,11 +333,7 @@ pub fn run_daemon(
             read_sysfs_counter("adjtime_skip_count"),
             read_sysfs_counter("adjtime_apply_count"),
         ) {
-            tracing::info!(
-                skipped = skip,
-                applied = apply,
-                "adjtime threshold stats"
-            );
+            tracing::info!(skipped = skip, applied = apply, "adjtime threshold stats");
         }
     }
 
@@ -337,12 +348,16 @@ fn ctrlc_handler<F: Fn() + Send + 'static>(handler: F) {
     {
         use std::sync::Once;
         static ONCE: Once = Once::new();
-        ONCE.call_once(move || {
-            unsafe {
-                HANDLER = Some(Box::new(handler));
-                libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
-                libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
-            }
+        ONCE.call_once(move || unsafe {
+            HANDLER = Some(Box::new(handler));
+            libc::signal(
+                libc::SIGTERM,
+                signal_handler as *const () as libc::sighandler_t,
+            );
+            libc::signal(
+                libc::SIGINT,
+                signal_handler as *const () as libc::sighandler_t,
+            );
         });
     }
 }

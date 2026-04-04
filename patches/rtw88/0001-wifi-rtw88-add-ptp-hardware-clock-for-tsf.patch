@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH] wifi: rtw88: add PTP hardware clock for TSF synchronization
+
+Register a PTP hardware clock (/dev/ptpN) for each rtw88 device,
+exposing the 802.11 TSF timer to the Linux PTP subsystem.  This enables
+phc2sys to synchronize TSF counters across co-located Realtek 802.11ac
+radios.
+
+PTP clock operations use direct register access:
+  gettime64  -> rtw_read32(REG_TSFTR_LOW) + rtw_read32(REG_TSFTR_HIGH)
+  settime64  -> rtw_write32 to both registers
+  adjtime    -> read-modify-write
+  adjfine    -> no-op (fixed crystal)
+
+The rtw88 driver lacks a REG_TSFTR define, so the TSF register offsets
+(0x0560 low, 0x0564 high) are defined locally in ptp.c.
+
+Covers: RTL8822BE/CE, RTL8723DE, RTL8821CE.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ 6 files changed, 177 insertions(+)
+ create mode 100644 drivers/net/wireless/realtek/rtw88/ptp.c
+ create mode 100644 drivers/net/wireless/realtek/rtw88/ptp.h
+
+diff --git a/drivers/net/wireless/realtek/rtw88/Kconfig b/drivers/net/wireless/realtek/rtw88/Kconfig
+--- a/drivers/net/wireless/realtek/rtw88/Kconfig
++++ b/drivers/net/wireless/realtek/rtw88/Kconfig
+@@ -13,6 +13,7 @@
+ config RTW88_CORE
+ 	tristate
+ 	select WANT_DEV_COREDUMP
++	select PTP_1588_CLOCK_OPTIONAL
+ 
+ config RTW88_PCI
+ 	tristate
+
+diff --git a/drivers/net/wireless/realtek/rtw88/Makefile b/drivers/net/wireless/realtek/rtw88/Makefile
+--- a/drivers/net/wireless/realtek/rtw88/Makefile
++++ b/drivers/net/wireless/realtek/rtw88/Makefile
+@@ -20,6 +20,8 @@
+ 
+ rtw88_core-$(CONFIG_PM) += wow.o
+ 
++rtw88_core-$(CONFIG_PTP_1588_CLOCK) += ptp.o
++
+ obj-$(CONFIG_RTW88_8822B)	+= rtw88_8822b.o
+ rtw88_8822b-objs		:= rtw8822b.o rtw8822b_table.o
+ 
+
+diff --git a/drivers/net/wireless/realtek/rtw88/main.h b/drivers/net/wireless/realtek/rtw88/main.h
+--- a/drivers/net/wireless/realtek/rtw88/main.h
++++ b/drivers/net/wireless/realtek/rtw88/main.h
+@@ -15,6 +15,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/workqueue.h>
+ 
++#include <linux/ptp_clock_kernel.h>
+ #include "util.h"
+ 
+ #define RTW_MAX_MAC_ID_NUM		32
+@@ -2073,6 +2074,11 @@
+ 	struct completion fw_scan_density;
+ 	bool ap_active;
+ 
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++	struct ptp_clock *ptp_clock;
++	struct ptp_clock_info ptp_info;
++#endif
++
+ 	/* hci related data, must be last */
+ 	u8 priv[] __aligned(sizeof(void *));
+ };
+
+diff --git a/drivers/net/wireless/realtek/rtw88/main.c b/drivers/net/wireless/realtek/rtw88/main.c
+--- a/drivers/net/wireless/realtek/rtw88/main.c
++++ b/drivers/net/wireless/realtek/rtw88/main.c
+@@ -19,6 +19,7 @@
+ #include "bf.h"
+ #include "sar.h"
+ #include "sdio.h"
++#include "ptp.h"
+ 
+ bool rtw_disable_lps_deep_mode;
+ EXPORT_SYMBOL(rtw_disable_lps_deep_mode);
+@@ -2289,6 +2290,8 @@
+ 	rtwdev->bf_info.bfer_mu_cnt = 0;
+ 	rtwdev->bf_info.bfer_su_cnt = 0;
+ 
++	rtw88_ptp_init(rtwdev);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(rtw_register_hw);
+@@ -2297,6 +2300,8 @@
+ {
+ 	const struct rtw_chip_info *chip = rtwdev->chip;
+ 
++	rtw88_ptp_remove(rtwdev);
++
+ 	ieee80211_unregister_hw(hw);
+ 	rtw_unset_supported_band(hw, chip);
+ 	rtw_debugfs_deinit(rtwdev);
+
+diff --git a/drivers/net/wireless/realtek/rtw88/ptp.c b/drivers/net/wireless/realtek/rtw88/ptp.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtw88/ptp.c
+@@ -0,0 +1,137 @@
++// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
++/*
++ * rtw88 PTP hardware clock — expose TSF as /dev/ptpN
++ *
++ * Maps PTP clock ops to Realtek's register-based TSF access:
++ *   gettime64  -> rtw_read32(REG_TSFTR_LOW) + rtw_read32(REG_TSFTR_HIGH)
++ *   settime64  -> rtw_write32 to both registers
++ *   adjtime    -> read-modify-write
++ *   adjfine    -> no-op (fixed crystal)
++ *
++ * The rtw88 driver does not define a REG_TSFTR symbol, so we define the
++ * raw offsets here.  The TSF timer is a 64-bit microsecond counter split
++ * across two 32-bit MMIO registers.
++ */
++
++#include <linux/ptp_clock_kernel.h>
++#include "main.h"
++#include "hci.h"
++#include "ptp.h"
++
++/* TSF timer registers — common across RTL8822B/C, RTL8723D, RTL8821C */
++#define REG_TSFTR_LOW	0x0560
++#define REG_TSFTR_HIGH	0x0564
++
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++
++static u64 rtw88_read_tsf(struct rtw_dev *rtwdev)
++{
++	u32 lo, hi, hi2;
++
++	/*
++	 * High-low-high read sequence to handle the case where the low
++	 * 32 bits wrap between the two high reads.
++	 */
++	hi  = rtw_read32(rtwdev, REG_TSFTR_HIGH);
++	lo  = rtw_read32(rtwdev, REG_TSFTR_LOW);
++	hi2 = rtw_read32(rtwdev, REG_TSFTR_HIGH);
++	if (hi != hi2) {
++		lo = rtw_read32(rtwdev, REG_TSFTR_LOW);
++		hi = hi2;
++	}
++
++	return ((u64)hi << 32) | lo;
++}
++
++static void rtw88_write_tsf(struct rtw_dev *rtwdev, u64 tsf)
++{
++	rtw_write32(rtwdev, REG_TSFTR_LOW, (u32)(tsf & 0xFFFFFFFF));
++	rtw_write32(rtwdev, REG_TSFTR_HIGH, (u32)(tsf >> 32));
++}
++
++static int rtw88_ptp_gettime64(struct ptp_clock_info *ptp,
++			       struct timespec64 *ts)
++{
++	struct rtw_dev *rtwdev = container_of(ptp, struct rtw_dev, ptp_info);
++	u64 tsf;
++
++	mutex_lock(&rtwdev->mutex);
++	tsf = rtw88_read_tsf(rtwdev);
++	mutex_unlock(&rtwdev->mutex);
++
++	*ts = ns_to_timespec64((s64)tsf * NSEC_PER_USEC);
++	return 0;
++}
++
++static int rtw88_ptp_settime64(struct ptp_clock_info *ptp,
++			       const struct timespec64 *ts)
++{
++	struct rtw_dev *rtwdev = container_of(ptp, struct rtw_dev, ptp_info);
++	u64 tsf = div_u64(timespec64_to_ns(ts), NSEC_PER_USEC);
++
++	mutex_lock(&rtwdev->mutex);
++	rtw88_write_tsf(rtwdev, tsf);
++	mutex_unlock(&rtwdev->mutex);
++
++	return 0;
++}
++
++static int rtw88_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
++{
++	struct rtw_dev *rtwdev = container_of(ptp, struct rtw_dev, ptp_info);
++	s64 delta_usec = div_s64(delta_ns, NSEC_PER_USEC);
++	u64 tsf;
++
++	mutex_lock(&rtwdev->mutex);
++	tsf = rtw88_read_tsf(rtwdev);
++	rtw88_write_tsf(rtwdev, tsf + delta_usec);
++	mutex_unlock(&rtwdev->mutex);
++
++	return 0;
++}
++
++static int rtw88_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++{
++	return 0;
++}
++
++void rtw88_ptp_init(struct rtw_dev *rtwdev)
++{
++	struct ptp_clock_info *info = &rtwdev->ptp_info;
++
++	memset(info, 0, sizeof(*info));
++	info->owner = THIS_MODULE;
++	snprintf(info->name, sizeof(info->name), "rtw88-%s",
++		 wiphy_name(rtwdev->hw->wiphy));
++	info->max_adj = 500000000;
++	info->gettime64 = rtw88_ptp_gettime64;
++	info->settime64 = rtw88_ptp_settime64;
++	info->adjtime = rtw88_ptp_adjtime;
++	info->adjfine = rtw88_ptp_adjfine;
++
++	rtwdev->ptp_clock = ptp_clock_register(info, rtwdev->dev);
++	if (IS_ERR(rtwdev->ptp_clock)) {
++		rtw_err(rtwdev, "PTP clock registration failed: %ld\n",
++			PTR_ERR(rtwdev->ptp_clock));
++		rtwdev->ptp_clock = NULL;
++		return;
++	}
++
++	rtw_info(rtwdev, "registered PTP clock (ptp%d)\n",
++		 ptp_clock_index(rtwdev->ptp_clock));
++}
++
++void rtw88_ptp_remove(struct rtw_dev *rtwdev)
++{
++	if (rtwdev->ptp_clock) {
++		ptp_clock_unregister(rtwdev->ptp_clock);
++		rtwdev->ptp_clock = NULL;
++	}
++}
++
++#else /* !CONFIG_PTP_1588_CLOCK */
++
++void rtw88_ptp_init(struct rtw_dev *rtwdev) {}
++void rtw88_ptp_remove(struct rtw_dev *rtwdev) {}
++
++#endif /* CONFIG_PTP_1588_CLOCK */
+diff --git a/drivers/net/wireless/realtek/rtw88/ptp.h b/drivers/net/wireless/realtek/rtw88/ptp.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtw88/ptp.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
++/*
++ * rtw88 PTP hardware clock declarations.
++ */
++
++#ifndef RTW88_PTP_H
++#define RTW88_PTP_H
++
++struct rtw_dev;
++
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++
++/* Register PTP clock for this device.  Call after ieee80211_register_hw. */
++void rtw88_ptp_init(struct rtw_dev *rtwdev);
++
++/* Unregister PTP clock.  Call before ieee80211_unregister_hw. */
++void rtw88_ptp_remove(struct rtw_dev *rtwdev);
++
++#else
++
++static inline void rtw88_ptp_init(struct rtw_dev *rtwdev) {}
++static inline void rtw88_ptp_remove(struct rtw_dev *rtwdev) {}
++
++#endif /* CONFIG_PTP_1588_CLOCK */
++
++#endif /* RTW88_PTP_H */

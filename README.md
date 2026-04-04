@@ -27,6 +27,9 @@ sudo nix run .#test-sync
 # MicroVM lifecycle test — boots a VM with hwsim + tsf_ptp, no root needed
 nix run .#tsf-sync-lifecycle-test-basic
 
+# MicroVM PTP selftest — lifecycle + wifi_ptp_test quick + 60s stability
+nix run .#tsf-sync-lifecycle-test-selftest
+
 # Cross-compile for aarch64
 nix build .#tsf-sync-aarch64-linux
 
@@ -191,11 +194,12 @@ If a future deployment needs sub-µs precision and uses register-based drivers (
 
 Three sync modes offer different points on the simplicity/performance tradeoff. All modes use the same kernel module (`tsf-ptp`) for PTP clock registration and TSF access — they differ only in where the read → compare → correct loop runs.
 
-| Mode | Flag | Kernel | Userspace | When to use |
-|------|------|--------|-----------|-------------|
-| **PTP + phc2sys** (default) | `--sync-mode ptp` | PTP clocks only | Spawns `phc2sys` | Default. Maximum ecosystem reuse, easiest debugging |
-| **Kernel sync loop** | `--sync-mode kernel` | PTP clocks + `delayed_work` timer | Monitor only (sysfs) | Lowest latency. No context switch. For sub-µs targets with register-based drivers |
-| **io_uring** | `--sync-mode iouring` | PTP clocks + `/dev/tsf_sync` char device | `io-uring` crate, batch read/write | Middle ground. Userspace algorithm with reduced syscall overhead |
+| Mode | Flag / Binary | Kernel | Userspace | When to use |
+|------|---------------|--------|-----------|-------------|
+| **A: PTP + phc2sys** (default) | `--sync-mode ptp` | PTP clocks only | Spawns `phc2sys` | Default. Maximum ecosystem reuse, easiest debugging |
+| **B: Kernel sync loop** | `--sync-mode kernel` | PTP clocks + `delayed_work` timer | Monitor only (sysfs) | Lowest latency. No context switch. For sub-µs targets with register-based drivers |
+| **C: io_uring** | `--sync-mode iouring` | PTP clocks + `/dev/tsf_sync` char device | `io-uring` crate, batch read/write | Middle ground. Userspace algorithm with reduced syscall overhead |
+| **D: Rust debugfs** | `tsf-sync-debugfs` | None (uses debugfs) | pread/pwrite + SIMD | No kernel module needed. Lab bring-up, benchmarking |
 
 ### Usage examples
 
@@ -292,6 +296,7 @@ No code changes from single-host to multi-host — just a `ptp4l` configuration 
 |-----------|-----------|-------------|
 | **[`tsf-ptp`](docs/kernel-module.md)** | Out-of-tree Linux kernel module | Registers a PTP clock (`/dev/ptpN`) per WiFi phy that has mac80211 `get_tsf`/`set_tsf`. |
 | **[`tsf-sync`](docs/userspace-tool.md)** | Rust CLI / NixOS service | Discovers cards, generates `ptp4l` config, manages lifecycle, monitors health. |
+| **[`tsf-sync-debugfs`](docs/debugfs-tool.md)** | Standalone Rust binary | Debugfs-based TSF sync with cached FDs, inline syscalls, SIMD hex parser. No kernel module needed. |
 
 ### What upstream provides (we don't maintain)
 
@@ -322,6 +327,30 @@ Full details: [Driver Compatibility Survey](docs/driver-survey.md)
 
 ---
 
+## Upstream Driver Patches
+
+We maintain per-driver PTP patches ready for upstream kernel submission. These add native `/dev/ptpN` support directly into each WiFi driver — the same pattern Intel's `iwlwifi` already uses — eliminating the need for the out-of-tree `tsf-ptp` module.
+
+| Driver | Chipsets | Access Method | PTP Ops | Kernel Versions |
+|--------|----------|--------------|---------|-----------------|
+| ath9k | AR9xxx | Register (AR_TSF_L32/U32) | get/set/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
+| ath10k | QCA988x, QCA6174 | WMI firmware | get/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
+| ath11k | QCA6390, WCN6855 | WMI firmware | adj only | v6.12 ✓, 6.18 ✗, 6.19 ✗ |
+| mt76 | MT7915/7921/7996 | Per-chipset callbacks | get/set/adj + crosststamp | v6.12 ✓, 6.18 ✓, 6.19 ✗ |
+| rtw88 | RTL8822BE/CE | Register (0x0560/0x0564) | get/set/adj | v6.12 ✓, 6.18 ✗, 6.19 ✗ |
+| rtw89 | RTL8852AE/BE | Register (R_AX_TSFTR_P0) | get/set/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
+
+Patches are verified against multiple kernel versions via Nix:
+
+```bash
+nix run .#patch-test-all        # Full test suite (format + apply + conflict)
+nix build .#patch-check-all     # Fast apply check (pinned v6.12)
+```
+
+Full details: [Upstream Driver Patches](docs/driver-patches.md)
+
+---
+
 ## Project Structure
 
 ```
@@ -346,7 +375,7 @@ tsf-sync/
 │       ├── test_hwsim.sh              # Full integration test with hwsim
 │       └── validate_hwsim_tsf.sh      # Foundation validation (no module needed)
 │
-├── src/                               # Rust userspace tool
+├── src/                               # Rust userspace tools
 │   ├── main.rs                        # CLI entry (discover, config, start, status, stop)
 │   ├── lib.rs                         # Re-exports
 │   ├── sync_mode.rs                   # SyncMode enum, UAPI struct definitions
@@ -356,28 +385,62 @@ tsf-sync/
 │   ├── health.rs                      # Health monitoring via pmc + sysfs
 │   ├── ptp4l.rs                       # ptp4l process management
 │   ├── iouring_sync.rs               # io_uring sync loop (Mode C, feature-gated)
-│   └── module_loader.rs               # Kernel module loading/unloading
+│   ├── module_loader.rs               # Kernel module loading/unloading
+│   └── bin/tsf_sync_debugfs/         # Standalone debugfs sync tool (Mode D)
+│       ├── main.rs                    # Entry point
+│       ├── cli.rs                     # Clap argument parsing
+│       ├── debugfs.rs                 # Cached fd TSF I/O (pread/pwrite)
+│       ├── asm/                       # Architecture-specific hot-path optimizations
+│       │   ├── syscall.rs             # Inline x86_64 syscall wrappers
+│       │   └── hex.rs                 # SSSE3 SIMD hex parser + scalar fallback
+│       ├── control.rs                 # Proportional controller + Kalman filter
+│       ├── stats.rs                   # Welford online statistics
+│       ├── rt.rs                      # RT scheduling (mlockall, SCHED_FIFO, affinity)
+│       ├── signal.rs                  # SIGINT/SIGTERM handler
+│       └── threading.rs              # Single + parallel sync loops
 │
-├── tests/                             # Rust tests
+├── tests/                             # Rust tests + kernel selftests
 │   ├── discovery_test.rs
 │   ├── config_gen_test.rs
-│   └── integration/
-│       └── hwsim_test.rs              # Full stack with mac80211_hwsim
+│   ├── integration/
+│   │   └── hwsim_test.rs              # Full stack with mac80211_hwsim
+│   └── selftests/
+│       └── wifi_ptp_test.c            # PTP clock integration tests (TAP output)
 │
 ├── nix/                               # NixOS packaging & testing
 │   ├── package.nix                    # Crane-based Rust build
 │   ├── kernel-module.nix              # Kernel module build
+│   ├── wifi-ptp-test.nix              # PTP selftest binary (C, cross-compiled)
 │   ├── cross.nix                      # Cross-compilation (aarch64, riscv64)
 │   ├── devshell.nix                   # Development shell (Rust + kernel headers)
 │   ├── ci.nix                         # CI checks (fmt, clippy, test, build)
 │   ├── module.nix                     # NixOS service module (systemd)
-│   ├── scripts.nix                    # Test/build helper scripts
+│   ├── scripts.nix                    # Test/build/benchmark helper scripts
 │   ├── overlays/                      # Nixpkgs overlays for cross builds
-│   └── tests/microvm/                 # MicroVM lifecycle testing
+│   └── tests/microvm/                 # MicroVM lifecycle testing & benchmarks
 │       ├── constants.nix              # Arch defs, ports, timeouts, variants
 │       ├── microvm.nix                # VM generator (hwsim + tsf_ptp)
-│       └── lifecycle/                 # Phased test scripts (boot → verify → shutdown)
+│       ├── lifecycle/                 # Phased test scripts (boot → verify → shutdown)
+│       └── benchmark/                 # Head-to-head all-modes benchmark harness
 │
+├── patches/                           # Per-driver upstream PTP kernel patches
+│   ├── ath9k/                         # Atheros AR9xxx
+│   ├── ath10k/                        # Qualcomm QCA988x/6174
+│   ├── ath11k/                        # Qualcomm QCA6390/WCN6855
+│   ├── mt76/                          # MediaTek MT7915/7921/7996
+│   ├── rtw88/                         # Realtek RTL8822/8723/8821
+│   ├── rtw89/                         # Realtek RTL8852/8851
+│   ├── lib.nix                        # Patch verification infrastructure
+│   ├── default.nix                    # Entry point (per-driver × per-kernel checks)
+│   ├── kernel-source.nix              # Pinned Linux v6.12 source
+│   └── test/                          # Automated test scripts
+│
+├── benches/
+│   └── hot_path.rs                    # Criterion benchmarks (SIMD, syscall, decimal)
+├── bench/
+│   └── fiwitsf.nix                    # Nix derivation for FiWiTSF (C reference)
+├── scripts/
+│   └── check-asm.sh                   # Automated assembly verification (7 checks)
 ├── flake.nix
 ├── Cargo.toml
 └── LICENSE
@@ -417,6 +480,8 @@ tsf-sync/
 | [Driver Compatibility Survey](docs/driver-survey.md) | TSF/PTP support across all Linux WiFi drivers | Complete |
 | [Kernel Module: tsf-ptp](docs/kernel-module.md) | Module design, PTP↔mac80211 mapping, challenges | Complete |
 | [Userspace Tool: tsf-sync](docs/userspace-tool.md) | CLI, daemon mode, discovery, config generation | Complete |
+| [Debugfs Tool: tsf-sync-debugfs](docs/debugfs-tool.md) | Standalone debugfs sync, SIMD, inline syscalls, benchmarks | Complete |
+| [Comparison: tsf-sync vs FiWiTSF](docs/comparison.md) | Head-to-head analysis, all 5 sync modes, benchmark results | Complete |
 | [PTP Topology & Scaling](docs/ptp-topology.md) | Single-host, multi-host, GPS input configurations | Complete |
 | [WiFi Timing Requirements](docs/wifi-timing.md) | 802.11 timing, sync accuracy targets, threshold tuning | Complete |
 | [Testing Strategy](docs/testing.md) | mac80211_hwsim, integration tests, test matrix | Complete |
@@ -425,7 +490,8 @@ tsf-sync/
 | [Nix Reference](docs/nix.md) | Flake outputs, dev shell, test scripts, NixOS module, CI | Complete |
 | [Deployment Guide](docs/deployment.md) | NixOS module, DKMS, manual setup | Complete |
 | [Multi-Host Operations](docs/multi-host.md) | Cross-host PTP setup, network requirements | Placeholder — Phase 2 |
-| [Upstream Roadmap](docs/upstream.md) | Per-driver PTP patches, kernel maintainer engagement | Placeholder — Phase 3 |
+| [Upstream Driver Patches](docs/driver-patches.md) | Per-driver PTP patches for 6 WiFi drivers, verification, submission | Complete |
+| [Rust mt76 Feasibility](docs/rust-mt76-ptp.md) | R4L feasibility study for Rust mt76 driver (all subsystems) | Complete |
 
 ---
 

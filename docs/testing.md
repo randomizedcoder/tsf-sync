@@ -111,6 +111,88 @@ Tests in `hwsim_test.rs`:
 
 ---
 
+## Debugfs Tool Tests
+
+### Unit tests (`cargo test --bin tsf-sync-debugfs`)
+
+53 tests across 6 modules:
+
+| Module | Tests | What they cover |
+|--------|:-----:|-----------------:|
+| `asm::hex` | 18 | Scalar parser (5), SIMD parser (10), auto-dispatch (3) |
+| `asm::syscall` | 4 | pread64/pwrite64 round-trip, bad fd, clock_nanosleep |
+| `control` | 12 | clamp_step (6), proportional controller (5), Kalman (1) |
+| `debugfs` | 8 | Decimal formatting (3), TsfFile I/O via tempfile (5) |
+| `rt` | 6 | advance_deadline (4), now_monotonic (2) |
+| `stats` | 5 | Welford accuracy, reset, negative errors |
+
+---
+
+## Assembly Verification
+
+Automated checks verify the compiler produced the expected hot-path assembly:
+
+```bash
+nix run .#check-asm            # 7 checks
+nix run .#check-asm -- --dump  # also print disassembly
+```
+
+| Check | What it verifies |
+|-------|-----------------|
+| `syscall` in `read_tsf` | Inline syscall, no libc PLT |
+| `syscall` in `write_tsf` | Inline syscall, no libc PLT |
+| `syscall` in `sleep_until` | Inline syscall, no libc PLT |
+| `syscall` in `run_single` | Inlined into hot loop |
+| No `call.*pread` | No libc pread PLT call |
+| No `call.*pwrite` | No libc pwrite PLT call |
+| PMADDUBSW/PMADDWD/PSHUFB | SSSE3 SIMD hex parser present |
+
+These checks run on the release binary (`--release`) and use `objdump -d` with demangled symbols.
+
+---
+
+## Criterion Microbenchmarks
+
+```bash
+nix run .#bench-hot-path
+# or: cargo bench --bench hot_path
+```
+
+Benchmarks the hot-path operations in isolation:
+
+| Benchmark | What it measures |
+|-----------|-----------------|
+| SIMD hex parse | SSSE3 pipeline throughput |
+| Scalar hex parse | Fallback parser throughput |
+| Inline syscall overhead | pread64 via `syscall` instruction |
+| Libc syscall overhead | pread64 via libc wrapper |
+| Decimal formatting | `format_u64_decimal` into stack buffer |
+
+---
+
+## MicroVM Benchmark Harness
+
+Head-to-head comparison of all 5 sync modes in a microVM with `mac80211_hwsim`:
+
+```bash
+nix run .#tsf-sync-benchmark-4      # 4 radios, 30s
+nix run .#tsf-sync-benchmark-24     # 24 radios, 60s
+nix run .#tsf-sync-benchmark-100    # 100 radios, 60s
+nix run .#tsf-sync-benchmark-all    # all radio counts
+```
+
+Each run:
+1. Boots a microVM with hwsim radios
+2. Runs each sync mode under `strace -c` (syscall counts) and `/usr/bin/time -v` (resource stats)
+3. Collects wall time, RSS, context switches, page faults, syscall counts
+4. Prints side-by-side comparison table
+
+Modes tested: phc2sys (A), kernel delayed_work (B), io_uring batch (C), Rust debugfs (D), C debugfs/FiWiTSF (E).
+
+See [Comparison: tsf-sync vs FiWiTSF](comparison.md) for detailed results.
+
+---
+
 ## Future Test Enhancements
 
 ### Clock drift simulation

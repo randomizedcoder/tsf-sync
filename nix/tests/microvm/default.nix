@@ -30,10 +30,17 @@ let
     microvmVariants = microvmLib.variants;
   };
 
+  benchmark = import ./benchmark {
+    inherit pkgs lib constants;
+    inherit (microvmLib) mkMicrovm;
+    microvmVariants = microvmLib.variants;
+  };
+
 in
 {
   packages =
     lifecycle.packages
+    // benchmark.packages
     # VM runners: tsf-sync-microvm-<arch>-<variant>
     // lib.mapAttrs' (
       name: vm: lib.nameValuePair "tsf-sync-microvm-${name}" vm.runner

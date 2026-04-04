@@ -42,6 +42,21 @@ nix build .#tsf-sync-aarch64-linux
 | `test-hwsim` | `sudo nix run .#test-hwsim` | Automated smoke test. See [Testing](#test-hwsim-smoke-test). |
 | `test-sync` | `sudo nix run .#test-sync` | Timed sync test with counter monitoring. See [Testing](#test-sync-integration-test). |
 | `build-kernel-module` | `nix run .#build-kernel-module` | Builds `tsf_ptp.ko` in-tree from the working directory. |
+| `check-asm` | `nix run .#check-asm` | Verifies hot-path assembly: inline syscalls, no PLT calls, SIMD instructions. |
+| `bench-hot-path` | `nix run .#bench-hot-path` | Criterion microbenchmarks: SIMD vs scalar, inline vs libc syscall, decimal formatting. |
+
+### Benchmark Packages
+
+Head-to-head comparison of all 5 sync modes inside a microVM. No root needed.
+
+| Target | Command | Description |
+|--------|---------|-------------|
+| `tsf-sync-benchmark-4` | `nix run .#tsf-sync-benchmark-4` | 4 radios, 30s per mode |
+| `tsf-sync-benchmark-24` | `nix run .#tsf-sync-benchmark-24` | 24 radios, 60s per mode |
+| `tsf-sync-benchmark-100` | `nix run .#tsf-sync-benchmark-100` | 100 radios, 60s per mode |
+| `tsf-sync-benchmark-all` | `nix run .#tsf-sync-benchmark-all` | All radio counts sequentially |
+
+Modes tested: A (phc2sys), B (kernel), C (io_uring), D (Rust debugfs), E (C debugfs / FiWiTSF). Collects `strace -c` syscall counts, `/usr/bin/time -v` resource stats, and `perf stat` counters when available.
 
 ### Cross-Compiled Packages (x86_64-linux host only)
 

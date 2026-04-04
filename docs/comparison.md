@@ -225,6 +225,59 @@ At 100+ cards, FiWiTSF's approach faces significant pressure: hundreds of RT thr
 
 ---
 
+## Benchmark Results
+
+### All sync modes at a glance
+
+The benchmark harness tests all 5 synchronization paths in a single microVM:
+
+| Mode | Binary | TSF access path | Syscalls per cycle (N followers) |
+|------|--------|-----------------|----------------------------------|
+| **A** phc2sys | `tsf-sync` | PTP clock ioctls | 2N + 2 |
+| **B** kernel | `tsf-sync` | In-kernel `delayed_work` | 0 (kernel-only) |
+| **C** io\_uring | `tsf-sync` | Batch `/dev/tsf_sync` | 2 (regardless of N) |
+| **D** Rust debugfs | `tsf-sync-debugfs` | `pread`/`pwrite` on debugfs | 2N + 2 |
+| **E** C debugfs | FiWiTSF | `open`/`read`/`close` on debugfs | 6N + 4 |
+
+### Debugfs syscall comparison: Rust (D) vs C (E)
+
+`tsf-sync-debugfs` reimplements FiWiTSF's debugfs approach with cached file descriptors (`pread`/`pwrite`, 1 syscall each) instead of `open`/`read`/`close` (3 syscalls each), plus SSSE3 SIMD hex parsing and inline `syscall` instructions (bypassing libc PLT).
+
+| | Master read | N follower reads | N follower writes | Sleep | Total |
+|---|---|---|---|---|---|
+| **C (FiWiTSF)** | 3 | 3N | 3N | 1 | 6N + 4 |
+| **Rust (pread/pwrite)** | 1 | N | N | 1 | 2N + 2 |
+
+| Radios | C syscalls/cycle | Rust syscalls/cycle | Reduction |
+|--------|-----------------|--------------------:|----------:|
+| 4 | 22 | 8 | 2.8x |
+| 24 | 148 | 50 | 3.0x |
+| 100 | 604 | 202 | 3.0x |
+
+### How to run
+
+```bash
+# Quick benchmark (4 radios, 30s)
+nix run .#tsf-sync-benchmark-4
+
+# Full scale (24 radios, 60s)
+nix run .#tsf-sync-benchmark-24
+
+# Stress test (100 radios, 60s)
+nix run .#tsf-sync-benchmark-100
+
+# All radio counts sequentially
+nix run .#tsf-sync-benchmark-all
+```
+
+The benchmark runs all 5 sync modes (phc2sys, kernel, io\_uring, Rust debugfs, C debugfs) inside a microVM with `mac80211_hwsim`, collecting `strace -c` syscall counts, `/usr/bin/time -v` resource stats, and `perf stat` counters when available.
+
+### Measured results
+
+*TODO: Fill in after running `nix run .#tsf-sync-benchmark-all` on target hardware.*
+
+---
+
 ## Conclusion
 
 **FiWiTSF** is well-suited for:
