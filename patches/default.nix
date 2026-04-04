@@ -29,6 +29,14 @@ let
     }))
   ) patchLib.driverPatches);
 
+  # Per-driver checks against net-next kernel (uses net-next rebased patches).
+  perDriverChecksNetNext = builtins.listToAttrs (map (drv:
+    lib.nameValuePair "patch-check-${drv.name}-net-next" (patchLib.mkPatchCheck (drv // {
+      kernelSrc = patchLib.kernelSources.net-next.src;
+      srcLabel = patchLib.kernelSources.net-next.label;
+    }))
+  ) patchLib.driverPatchesNetNext);
+
   # Combined checks per kernel version.
   allChecks = {
     patch-check-all = patchLib.mkAllPatchesCheck {};
@@ -40,6 +48,11 @@ let
       kernelSrc = patchLib.kernelSources.latest.src;
       srcLabel = patchLib.kernelSources.latest.label;
     };
+    patch-check-all-net-next = patchLib.mkAllPatchesCheck {
+      kernelSrc = patchLib.kernelSources.net-next.src;
+      srcLabel = patchLib.kernelSources.net-next.label;
+      patches = patchLib.driverPatchesNetNext;
+    };
   };
 
   # Per-driver full kernel builds (slow, cached).
@@ -50,7 +63,7 @@ let
 in
 {
   packages = perDriverChecks // perDriverChecksStable // perDriverChecksLatest
-    // allChecks // perDriverKernels;
+    // perDriverChecksNetNext // allChecks // perDriverKernels;
   inherit (patchLib) driverPatches kernelSource kernelSources;
   patchedKernel = patchLib.mkAllPatchedKernel {};
 }

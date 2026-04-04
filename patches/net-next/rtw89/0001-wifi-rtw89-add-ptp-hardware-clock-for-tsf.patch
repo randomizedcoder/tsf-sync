@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH] wifi: rtw89: add PTP hardware clock for TSF synchronization
+
+Register a PTP hardware clock (/dev/ptpN) for each rtw89 device,
+exposing the 802.11 TSF timer to the Linux PTP subsystem. This enables
+phc2sys to synchronize TSF counters across co-located Realtek 802.11ax
+radios.
+
+PTP clock operations use direct register access:
+  gettime64  -> rtw89_read32(R_AX_TSFTR_LOW_P0) + rtw89_read32(R_AX_TSFTR_HIGH_P0)
+  settime64  -> rtw89_write32 to both registers
+  adjtime    -> read-modify-write
+  adjfine    -> no-op (fixed crystal)
+
+The AX-generation port 0 TSF register addresses (R_AX_TSFTR_LOW_P0 at
+0xC438, R_AX_TSFTR_HIGH_P0 at 0xC43C) are already defined in reg.h.
+
+Covers: RTL8852AE/BE, RTL8851BE (WiFi 6/6E).
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ drivers/net/wireless/realtek/rtw89/Kconfig  |   1 +
+ drivers/net/wireless/realtek/rtw89/Makefile |   2 +
+ drivers/net/wireless/realtek/rtw89/core.c   |   3 +
+ drivers/net/wireless/realtek/rtw89/core.h   |   6 +
+ drivers/net/wireless/realtek/rtw89/ptp.c    | 140 ++++++++++++++++++++
+ drivers/net/wireless/realtek/rtw89/ptp.h    |  17 +++
+ 6 files changed, 169 insertions(+)
+ create mode 100644 drivers/net/wireless/realtek/rtw89/ptp.c
+ create mode 100644 drivers/net/wireless/realtek/rtw89/ptp.h
+
+diff --git a/drivers/net/wireless/realtek/rtw89/Kconfig b/drivers/net/wireless/realtek/rtw89/Kconfig
+--- a/drivers/net/wireless/realtek/rtw89/Kconfig
++++ b/drivers/net/wireless/realtek/rtw89/Kconfig
+@@ -13,6 +13,7 @@
+ config RTW89_CORE
+ 	tristate
+ 	select WANT_DEV_COREDUMP
++	select PTP_1588_CLOCK_OPTIONAL
+ 
+ config RTW89_PCI
+ 	tristate
+diff --git a/drivers/net/wireless/realtek/rtw89/Makefile b/drivers/net/wireless/realtek/rtw89/Makefile
+--- a/drivers/net/wireless/realtek/rtw89/Makefile
++++ b/drivers/net/wireless/realtek/rtw89/Makefile
+@@ -22,6 +22,8 @@
+ 
+ rtw89_core-$(CONFIG_PM) += wow.o
+ 
++rtw89_core-$(CONFIG_PTP_1588_CLOCK) += ptp.o
++
+ obj-$(CONFIG_RTW89_8851B) += rtw89_8851b.o
+ rtw89_8851b-objs := rtw8851b.o \
+ 		    rtw8851b_table.o \
+diff --git a/drivers/net/wireless/realtek/rtw89/core.c b/drivers/net/wireless/realtek/rtw89/core.c
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -14,6 +14,7 @@
+ #include "mac.h"
+ #include "phy.h"
+ #include "ps.h"
++#include "ptp.h"
+ #include "reg.h"
+ #include "sar.h"
+ #include "ser.h"
+@@ -6726,12 +6727,14 @@
+ 	rtw89_phy_dm_init_data(rtwdev);
+ 	rtw89_debugfs_init(rtwdev);
+ 
++	rtw89_ptp_init(rtwdev);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(rtw89_core_register);
+ 
+ void rtw89_core_unregister(struct rtw89_dev *rtwdev)
+ {
++	rtw89_ptp_remove(rtwdev);
+ 	rtw89_core_unregister_hw(rtwdev);
+ 
+ 	rtw89_debugfs_deinit(rtwdev);
+diff --git a/drivers/net/wireless/realtek/rtw89/core.h b/drivers/net/wireless/realtek/rtw89/core.h
+--- a/drivers/net/wireless/realtek/rtw89/core.h
++++ b/drivers/net/wireless/realtek/rtw89/core.h
+@@ -10,6 +10,7 @@
+ #include <linux/dmi.h>
+ #include <linux/firmware.h>
+ #include <linux/iopoll.h>
++#include <linux/ptp_clock_kernel.h>
+ #include <linux/workqueue.h>
+ #include <net/mac80211.h>
+ 
+@@ -6263,6 +6264,11 @@
+ 	struct rtw89_debugfs *debugfs;
+ 	struct rtw89_vif *pure_monitor_mode_vif;
+ 
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++	struct ptp_clock *ptp_clock;
++	struct ptp_clock_info ptp_info;
++#endif
++
+ 	/* HCI related data, keep last */
+ 	u8 priv[] __aligned(sizeof(void *));
+ };
+diff --git a/drivers/net/wireless/realtek/rtw89/ptp.c b/drivers/net/wireless/realtek/rtw89/ptp.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtw89/ptp.c
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
++/*
++ * rtw89 PTP hardware clock -- expose TSF as /dev/ptpN
++ *
++ * Maps PTP clock ops to register-based TSF access.
++ * rtw89 uses the mac80211 get_tsf/set_tsf path which reads per-port
++ * TSF registers.  For PTP, we use port 0 (primary) TSF directly.
++ *
++ * TSF is in microseconds (802.11); PTP is in nanoseconds.
++ */
++
++#include <linux/ptp_clock_kernel.h>
++#include "core.h"
++#include "debug.h"
++#include "reg.h"
++#include "ptp.h"
++
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++
++/*
++ * Read TSF from port 0 registers (AX generation).
++ *
++ * R_AX_TSFTR_LOW_P0  (0xC438) -- low  32 bits
++ * R_AX_TSFTR_HIGH_P0 (0xC43C) -- high 32 bits
++ *
++ * High-low-high sequence guards against the low half wrapping
++ * between the two high reads.
++ */
++static u64 rtw89_ptp_read_tsf(struct rtw89_dev *rtwdev)
++{
++	u32 lo, hi, hi2;
++
++	hi  = rtw89_read32(rtwdev, R_AX_TSFTR_HIGH_P0);
++	lo  = rtw89_read32(rtwdev, R_AX_TSFTR_LOW_P0);
++	hi2 = rtw89_read32(rtwdev, R_AX_TSFTR_HIGH_P0);
++	if (hi != hi2) {
++		lo = rtw89_read32(rtwdev, R_AX_TSFTR_LOW_P0);
++		hi = hi2;
++	}
++
++	return ((u64)hi << 32) | lo;
++}
++
++static void rtw89_ptp_write_tsf(struct rtw89_dev *rtwdev, u64 tsf)
++{
++	rtw89_write32(rtwdev, R_AX_TSFTR_LOW_P0, (u32)(tsf & 0xFFFFFFFF));
++	rtw89_write32(rtwdev, R_AX_TSFTR_HIGH_P0, (u32)(tsf >> 32));
++}
++
++static int rtw89_ptp_gettime64(struct ptp_clock_info *ptp,
++			       struct timespec64 *ts)
++{
++	struct rtw89_dev *rtwdev = container_of(ptp, struct rtw89_dev, ptp_info);
++	u64 tsf;
++
++	mutex_lock(&rtwdev->mutex);
++	tsf = rtw89_ptp_read_tsf(rtwdev);
++	mutex_unlock(&rtwdev->mutex);
++
++	*ts = ns_to_timespec64((s64)tsf * NSEC_PER_USEC);
++	return 0;
++}
++
++static int rtw89_ptp_settime64(struct ptp_clock_info *ptp,
++			       const struct timespec64 *ts)
++{
++	struct rtw89_dev *rtwdev = container_of(ptp, struct rtw89_dev, ptp_info);
++	u64 tsf = div_u64(timespec64_to_ns(ts), NSEC_PER_USEC);
++
++	mutex_lock(&rtwdev->mutex);
++	rtw89_ptp_write_tsf(rtwdev, tsf);
++	mutex_unlock(&rtwdev->mutex);
++
++	return 0;
++}
++
++static int rtw89_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
++{
++	struct rtw89_dev *rtwdev = container_of(ptp, struct rtw89_dev, ptp_info);
++	s64 delta_usec = div_s64(delta_ns, NSEC_PER_USEC);
++	u64 tsf;
++
++	mutex_lock(&rtwdev->mutex);
++	tsf = rtw89_ptp_read_tsf(rtwdev);
++	rtw89_ptp_write_tsf(rtwdev, tsf + delta_usec);
++	mutex_unlock(&rtwdev->mutex);
++
++	return 0;
++}
++
++static int rtw89_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++{
++	/*
++	 * WiFi cards use a fixed crystal oscillator -- no hardware frequency
++	 * tuning.  Return 0 so tools like phc2sys consider the clock
++	 * adjustable.  Actual sync happens via time-stepping (adjtime).
++	 */
++	return 0;
++}
++
++void rtw89_ptp_init(struct rtw89_dev *rtwdev)
++{
++	struct ptp_clock_info *info = &rtwdev->ptp_info;
++
++	memset(info, 0, sizeof(*info));
++	info->owner = THIS_MODULE;
++	snprintf(info->name, sizeof(info->name), "rtw89-%s",
++		 wiphy_name(rtwdev->hw->wiphy));
++	info->max_adj = 500000000;
++	info->gettime64 = rtw89_ptp_gettime64;
++	info->settime64 = rtw89_ptp_settime64;
++	info->adjtime = rtw89_ptp_adjtime;
++	info->adjfine = rtw89_ptp_adjfine;
++
++	rtwdev->ptp_clock = ptp_clock_register(info, rtwdev->dev);
++	if (IS_ERR(rtwdev->ptp_clock)) {
++		rtw89_err(rtwdev, "PTP clock registration failed: %ld\n",
++			  PTR_ERR(rtwdev->ptp_clock));
++		rtwdev->ptp_clock = NULL;
++		return;
++	}
++
++	rtw89_info(rtwdev, "registered PTP clock (ptp%d)\n",
++		   ptp_clock_index(rtwdev->ptp_clock));
++}
++
++void rtw89_ptp_remove(struct rtw89_dev *rtwdev)
++{
++	if (rtwdev->ptp_clock) {
++		ptp_clock_unregister(rtwdev->ptp_clock);
++		rtwdev->ptp_clock = NULL;
++	}
++}
++
++#else /* !CONFIG_PTP_1588_CLOCK */
++
++void rtw89_ptp_init(struct rtw89_dev *rtwdev) {}
++void rtw89_ptp_remove(struct rtw89_dev *rtwdev) {}
++
++#endif /* CONFIG_PTP_1588_CLOCK */
+diff --git a/drivers/net/wireless/realtek/rtw89/ptp.h b/drivers/net/wireless/realtek/rtw89/ptp.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtw89/ptp.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
++/*
++ * rtw89 PTP hardware clock declarations.
++ */
++
++#ifndef RTW89_PTP_H
++#define RTW89_PTP_H
++
++struct rtw89_dev;
++
++/* Register PTP clock for this device.  Call after rtw89_core_register_hw. */
++void rtw89_ptp_init(struct rtw89_dev *rtwdev);
++
++/* Unregister PTP clock.  Call before rtw89_core_unregister_hw. */
++void rtw89_ptp_remove(struct rtw89_dev *rtwdev);
++
++#endif /* RTW89_PTP_H */
+-- 
+2.47.0
+

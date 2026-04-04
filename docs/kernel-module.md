@@ -16,7 +16,7 @@ For each WiFi phy that has `get_tsf`/`set_tsf` in its `ieee80211_ops`:
 | `gettime64` | `get_tsf` | Read TSF, convert µs → timespec64. Bracket with `ktime_get_raw_ns()` for cross-clock correlation. |
 | `settime64` | `set_tsf` | Convert timespec64 → µs, write TSF. |
 | `adjtime` | `get_tsf` + `set_tsf` | Read, add offset, write. (No driver implements `offset_tsf`, so we do read-modify-write.) |
-| `adjfine` | Not supported | Return `-EOPNOTSUPP`. WiFi cards don't have tunable oscillators. PTP will fall back to periodic `settime64`/`adjtime`. |
+| `adjfine` | No-op (returns 0) | WiFi cards lack tunable oscillators. Returns 0 so phc2sys treats clock as adjustable; actual sync via adjtime stepping. |
 | `getcrosststamp` | `get_tsf` + `ktime_get_raw_ns()` | Bracket TSF read with system timestamps for `PTP_SYS_OFFSET_PRECISE`. |
 
 ---
