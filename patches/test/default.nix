@@ -325,7 +325,7 @@ let
   #
   patch-test-all = pkgs.writeShellApplication {
     name = "tsf-sync-patch-test-all";
-    runtimeInputs = with pkgs; [ gnupatch diffstat coreutils gnugrep gawk ];
+    runtimeInputs = with pkgs; [ gnupatch diffstat coreutils gnugrep gawk gnutar xz ];
     text = ''
       echo "╔══════════════════════════════════════════════════╗"
       echo "║  Upstream PTP Patch — Full Test Suite            ║"
@@ -397,6 +397,69 @@ let
       echo ""
       total=$((apply_pass + apply_fail))
       echo "  Apply: $apply_pass/$total passed"
+      echo ""
+
+      # ── Phase 2b: Multi-kernel verification ─────────────────────
+      echo "┌─ Phase 2b: Multi-kernel verification ──────────────┐"
+      echo ""
+      echo "  Testing patches against additional kernel versions."
+      echo "  Failures here indicate patches may need updating."
+      echo ""
+
+      prepare_kernel_src() {
+        local dest="$1"
+        local ksrc="$2"
+        rm -rf "$dest"
+        if [ -d "$ksrc" ]; then
+          cp -r "$ksrc" "$dest"
+        else
+          mkdir -p "$dest"
+          tar xf "$ksrc" -C "$dest" --strip-components=1
+        fi
+        chmod -R u+w "$dest"
+      }
+
+      echo "  Kernel: ${patchLib.kernelSources.stable.label}"
+      prepare_kernel_src "$src/kern" "${patchLib.kernelSources.stable.src}"
+      cd "$src/kern"
+
+      stable_pass=0
+      stable_fail=0
+      ${lib.concatMapStringsSep "\n" (drv: ''
+        printf "    %-14s " "${drv.name}"
+        if patch -p1 --dry-run < ${drv.patch} > /dev/null 2>&1; then
+          echo "PASS"
+          stable_pass=$((stable_pass + 1))
+        else
+          echo "FAIL"
+          stable_fail=$((stable_fail + 1))
+        fi
+      '') patchLib.driverPatches}
+      echo ""
+
+      echo "  Kernel: ${patchLib.kernelSources.latest.label}"
+      prepare_kernel_src "$src/kern" "${patchLib.kernelSources.latest.src}"
+      cd "$src/kern"
+
+      latest_pass=0
+      latest_fail=0
+      ${lib.concatMapStringsSep "\n" (drv: ''
+        printf "    %-14s " "${drv.name}"
+        if patch -p1 --dry-run < ${drv.patch} > /dev/null 2>&1; then
+          echo "PASS"
+          latest_pass=$((latest_pass + 1))
+        else
+          echo "FAIL"
+          latest_fail=$((latest_fail + 1))
+        fi
+      '') patchLib.driverPatches}
+      echo ""
+
+      echo "  Stable: $stable_pass/${toString (builtins.length patchLib.driverPatches)} passed"
+      echo "  Latest: $latest_pass/${toString (builtins.length patchLib.driverPatches)} passed"
+      if [ "$stable_fail" -gt 0 ] || [ "$latest_fail" -gt 0 ]; then
+        echo "  WARNING: some patches may need updating for newer kernels"
+      fi
       echo ""
 
       # ── Phase 3: Sequential apply (conflict check) ──────────────

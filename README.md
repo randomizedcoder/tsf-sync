@@ -324,6 +324,30 @@ Full details: [Driver Compatibility Survey](docs/driver-survey.md)
 
 ---
 
+## Upstream Driver Patches
+
+We maintain per-driver PTP patches ready for upstream kernel submission. These add native `/dev/ptpN` support directly into each WiFi driver — the same pattern Intel's `iwlwifi` already uses — eliminating the need for the out-of-tree `tsf-ptp` module.
+
+| Driver | Chipsets | Access Method | PTP Ops | Kernel Versions |
+|--------|----------|--------------|---------|-----------------|
+| ath9k | AR9xxx | Register (AR_TSF_L32/U32) | get/set/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
+| ath10k | QCA988x, QCA6174 | WMI firmware | get/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
+| ath11k | QCA6390, WCN6855 | WMI firmware | adj only | v6.12 ✓, 6.18 ✗, 6.19 ✗ |
+| mt76 | MT7915/7921/7996 | Per-chipset callbacks | get/set/adj + crosststamp | v6.12 ✓, 6.18 ✓, 6.19 ✗ |
+| rtw88 | RTL8822BE/CE | Register (0x0560/0x0564) | get/set/adj | v6.12 ✓, 6.18 ✗, 6.19 ✗ |
+| rtw89 | RTL8852AE/BE | Register (R_AX_TSFTR_P0) | get/set/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
+
+Patches are verified against multiple kernel versions via Nix:
+
+```bash
+nix run .#patch-test-all        # Full test suite (format + apply + conflict)
+nix build .#patch-check-all     # Fast apply check (pinned v6.12)
+```
+
+Full details: [Upstream Driver Patches](docs/driver-patches.md)
+
+---
+
 ## Project Structure
 
 ```
@@ -393,6 +417,18 @@ tsf-sync/
 │       ├── lifecycle/                 # Phased test scripts (boot → verify → shutdown)
 │       └── benchmark/                 # Head-to-head all-modes benchmark harness
 │
+├── patches/                           # Per-driver upstream PTP kernel patches
+│   ├── ath9k/                         # Atheros AR9xxx
+│   ├── ath10k/                        # Qualcomm QCA988x/6174
+│   ├── ath11k/                        # Qualcomm QCA6390/WCN6855
+│   ├── mt76/                          # MediaTek MT7915/7921/7996
+│   ├── rtw88/                         # Realtek RTL8822/8723/8821
+│   ├── rtw89/                         # Realtek RTL8852/8851
+│   ├── lib.nix                        # Patch verification infrastructure
+│   ├── default.nix                    # Entry point (per-driver × per-kernel checks)
+│   ├── kernel-source.nix              # Pinned Linux v6.12 source
+│   └── test/                          # Automated test scripts
+│
 ├── benches/
 │   └── hot_path.rs                    # Criterion benchmarks (SIMD, syscall, decimal)
 ├── bench/
@@ -448,7 +484,8 @@ tsf-sync/
 | [Nix Reference](docs/nix.md) | Flake outputs, dev shell, test scripts, NixOS module, CI | Complete |
 | [Deployment Guide](docs/deployment.md) | NixOS module, DKMS, manual setup | Complete |
 | [Multi-Host Operations](docs/multi-host.md) | Cross-host PTP setup, network requirements | Placeholder — Phase 2 |
-| [Upstream Roadmap](docs/upstream.md) | Per-driver PTP patches, kernel maintainer engagement | Placeholder — Phase 3 |
+| [Upstream Driver Patches](docs/driver-patches.md) | Per-driver PTP patches for 6 WiFi drivers, verification, submission | Complete |
+| [Rust mt76 Feasibility](docs/rust-mt76-ptp.md) | R4L feasibility study for Rust mt76 driver (all subsystems) | Complete |
 
 ---
 

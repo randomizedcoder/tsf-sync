@@ -1,14 +1,33 @@
 # Shared infrastructure for upstream WiFi PTP patches.
 #
 # Provides functions to:
-#   - Verify patches apply cleanly to pinned kernel source
+#   - Verify patches apply cleanly to kernel source (pinned, stable, latest)
 #   - Build a full kernel with patches applied
 #   - Generate microVM test configurations with patched kernels
 #
 { pkgs, lib }:
 let
-  kernelSource = import ./kernel-source.nix {
+  pinnedKernelSource = import ./kernel-source.nix {
     inherit (pkgs) fetchFromGitHub;
+  };
+
+  # Multiple kernel sources for cross-version patch verification.
+  #   pinned — development target (v6.12), always tested
+  #   stable — pkgs.linuxPackages (latest stable from nixpkgs)
+  #   latest — pkgs.linuxPackages_latest (bleeding edge from nixpkgs)
+  kernelSources = {
+    pinned = {
+      label = "v6.12";
+      src = pinnedKernelSource;
+    };
+    stable = {
+      label = "stable-${pkgs.linuxPackages.kernel.version}";
+      src = pkgs.linuxPackages.kernel.src;
+    };
+    latest = {
+      label = "latest-${pkgs.linuxPackages_latest.kernel.version}";
+      src = pkgs.linuxPackages_latest.kernel.src;
+    };
   };
 
   driverPatches = [
@@ -21,22 +40,29 @@ let
   ];
 in
 {
-  inherit kernelSource driverPatches;
+  inherit pinnedKernelSource kernelSources driverPatches;
+
+  # Backward compatibility alias.
+  kernelSource = pinnedKernelSource;
 
   # ── Fast check: verify a single patch applies cleanly (no build) ─────
   #
-  # Copies the pinned kernel source, runs `patch -p1 --dry-run`, and
-  # succeeds only if the patch applies without rejects.
-  mkPatchCheck = { name, patch }:
-    pkgs.runCommand "patch-check-${name}" {
-      nativeBuildInputs = [ pkgs.gnupatch ];
+  # Handles both unpacked directories (fetchFromGitHub) and tarballs
+  # (fetchurl from nixpkgs kernel packages).
+  mkPatchCheck = { name, patch, kernelSrc ? pinnedKernelSource, srcLabel ? "v6.12" }:
+    pkgs.runCommand "patch-check-${name}-${srcLabel}" {
+      nativeBuildInputs = with pkgs; [ gnupatch gnutar xz ];
     } ''
-      cp -r ${kernelSource} src
+      if [ -d "${kernelSrc}" ]; then
+        cp -r "${kernelSrc}" src
+      else
+        mkdir src && tar xf "${kernelSrc}" -C src --strip-components=1
+      fi
       chmod -R u+w src
       cd src
-      echo "Checking patch: ${name}"
+      echo "Checking: ${name} against kernel ${srcLabel}"
       patch -p1 --dry-run < ${patch}
-      echo "PASS: ${name} applies cleanly"
+      echo "PASS: ${name} applies cleanly against ${srcLabel}"
       mkdir -p $out
       echo "${name}" > $out/name
     '';
@@ -66,18 +92,22 @@ in
   # ── Combined check: all patches apply to the same tree ──────────────
   #
   # Applies all patches sequentially to verify they don't conflict.
-  mkAllPatchesCheck =
-    pkgs.runCommand "patch-check-all" {
-      nativeBuildInputs = [ pkgs.gnupatch ];
+  mkAllPatchesCheck = { kernelSrc ? pinnedKernelSource, srcLabel ? "v6.12" }:
+    pkgs.runCommand "patch-check-all-${srcLabel}" {
+      nativeBuildInputs = with pkgs; [ gnupatch gnutar xz ];
     } ''
-      cp -r ${kernelSource} src
+      if [ -d "${kernelSrc}" ]; then
+        cp -r "${kernelSrc}" src
+      else
+        mkdir src && tar xf "${kernelSrc}" -C src --strip-components=1
+      fi
       chmod -R u+w src
       cd src
       ${lib.concatMapStringsSep "\n" (p: ''
         echo "Applying: ${p.name}"
         patch -p1 < ${p.patch}
       '') driverPatches}
-      echo "PASS: all ${toString (builtins.length driverPatches)} patches apply cleanly"
+      echo "PASS: all ${toString (builtins.length driverPatches)} patches apply against ${srcLabel}"
       mkdir -p $out
       echo "all" > $out/name
     '';
