@@ -84,6 +84,8 @@ let
       radios = variantConfig.radios;
       threshold = variantConfig.threshold;
       syncMode = variantConfig.syncMode;
+      hasSelftest = variantConfig ? selftestDuration;
+      selftestDuration = variantConfig.selftestDuration or 60;
     in
     pkgs.writeShellApplication {
       name = "tsf-sync-lifecycle-test-${arch}-${variantName}";
@@ -213,6 +215,16 @@ let
         # ─── Phase 11: tsf-sync status ────────────────────────────────
         phase_header "11" "tsf-sync status" "${toString archTimeouts.status}"
         ${tsfChecks.mkStatusCheck}
+
+        ${lib.optionalString hasSelftest ''
+        # ─── Phase 11a: Quick PTP Selftest ────────────────────────────
+        phase_header "11a" "Quick PTP Selftest (wifi_ptp_test --quick)" "${toString archTimeouts.selftestQuick}"
+        ${tsfChecks.mkSelftestQuickCheck}
+
+        # ─── Phase 11b: Long PTP Selftest ─────────────────────────────
+        phase_header "11b" "Long PTP Selftest (${toString selftestDuration}s)" "${toString archTimeouts.selftestLong}"
+        ${tsfChecks.mkSelftestLongCheck { duration = selftestDuration; }}
+        ''}
 
         # ─── Phase 12: Shutdown ───────────────────────────────────────
         phase_header "12" "Shutdown" "${toString archTimeouts.shutdown}"

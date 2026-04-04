@@ -27,6 +27,9 @@ sudo nix run .#test-sync
 # MicroVM lifecycle test — boots a VM with hwsim + tsf_ptp, no root needed
 nix run .#tsf-sync-lifecycle-test-basic
 
+# MicroVM PTP selftest — lifecycle + wifi_ptp_test quick + 60s stability
+nix run .#tsf-sync-lifecycle-test-selftest
+
 # Cross-compile for aarch64
 nix build .#tsf-sync-aarch64-linux
 
@@ -396,15 +399,18 @@ tsf-sync/
 │       ├── signal.rs                  # SIGINT/SIGTERM handler
 │       └── threading.rs              # Single + parallel sync loops
 │
-├── tests/                             # Rust tests
+├── tests/                             # Rust tests + kernel selftests
 │   ├── discovery_test.rs
 │   ├── config_gen_test.rs
-│   └── integration/
-│       └── hwsim_test.rs              # Full stack with mac80211_hwsim
+│   ├── integration/
+│   │   └── hwsim_test.rs              # Full stack with mac80211_hwsim
+│   └── selftests/
+│       └── wifi_ptp_test.c            # PTP clock integration tests (TAP output)
 │
 ├── nix/                               # NixOS packaging & testing
 │   ├── package.nix                    # Crane-based Rust build
 │   ├── kernel-module.nix              # Kernel module build
+│   ├── wifi-ptp-test.nix              # PTP selftest binary (C, cross-compiled)
 │   ├── cross.nix                      # Cross-compilation (aarch64, riscv64)
 │   ├── devshell.nix                   # Development shell (Rust + kernel headers)
 │   ├── ci.nix                         # CI checks (fmt, clippy, test, build)

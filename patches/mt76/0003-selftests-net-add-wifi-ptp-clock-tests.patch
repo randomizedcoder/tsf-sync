@@ -1,0 +1,439 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH 3/3] selftests: net: add WiFi PTP clock integration tests
+
+Add a selftest exercising PTP hardware clocks registered by WiFi
+drivers (mt76, ath9k, rtw88 etc.). The test validates the userspace-
+visible behaviour of PTP clocks that expose 802.11 TSF counters:
+
+  1. Monotonicity — clock_gettime never goes backward
+  2. Set/get round-trip — microsecond quantization, bounded loss
+  3. Adjtime accuracy — signed delta applied correctly
+  4. Long-running stability — no backward steps over configurable
+     duration (default 60 s)
+  5. Rapid-fire stress — 10 000 back-to-back reads without error
+
+The test accepts any /dev/ptpN device. For CI without hardware, use
+mac80211_hwsim + the tsf-ptp module to create virtual PTP clocks:
+
+  modprobe mac80211_hwsim radios=2
+  modprobe tsf_ptp
+  ./wifi_ptp_test /dev/ptp0
+
+All WiFi PTP driver patches use the same TSF µs ↔ PTP ns conversion,
+so this selftest validates the shared userspace contract regardless
+of which driver registered the clock.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ tools/testing/selftests/net/Makefile         |   1 +
+ tools/testing/selftests/net/wifi_ptp_test.c  | 312 ++++++++++++++++++++
+ 2 files changed, 313 insertions(+)
+ create mode 100644 tools/testing/selftests/net/wifi_ptp_test.c
+
+diff --git a/tools/testing/selftests/net/Makefile b/tools/testing/selftests/net/Makefile
+--- a/tools/testing/selftests/net/Makefile
++++ b/tools/testing/selftests/net/Makefile
+@@ -98,6 +98,7 @@ TEST_GEN_PROGS += so_incoming_cpu
+ TEST_GEN_PROGS += so_netns_cookie
+ TEST_GEN_PROGS += tcp_sock_destroy
+ TEST_GEN_PROGS += unix_connect
++TEST_GEN_PROGS += wifi_ptp_test
+
+ TEST_FILES := settings
+
+diff --git a/tools/testing/selftests/net/wifi_ptp_test.c b/tools/testing/selftests/net/wifi_ptp_test.c
+new file mode 100644
+--- /dev/null
++++ b/tools/testing/selftests/net/wifi_ptp_test.c
+@@ -0,0 +1,312 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * WiFi PTP clock integration tests
++ *
++ * Exercises PTP hardware clocks registered by WiFi drivers. These
++ * clocks expose 802.11 TSF counters (microsecond resolution) via the
++ * PTP kernel API. The test validates the userspace-visible contract:
++ *
++ *   - clock_gettime returns monotonically increasing values
++ *   - clock_settime + clock_gettime round-trips within 1 µs
++ *   - clock_adjtime applies signed deltas correctly
++ *   - The clock remains stable over extended operation
++ *
++ * Usage:
++ *   ./wifi_ptp_test /dev/ptp0              # default 60s long-run
++ *   ./wifi_ptp_test /dev/ptp0 --duration 300   # 5-minute stability
++ *   ./wifi_ptp_test /dev/ptp0 --quick          # skip long-running
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/timex.h>
++#include <time.h>
++#include <unistd.h>
++
++#ifndef CLOCK_INVALID
++#define CLOCK_INVALID -1
++#endif
++
++/* Convert PTP fd to clockid. See include/uapi/linux/posix-timers.h */
++#define FD_TO_CLOCKID(fd) ((clockid_t)((((unsigned int)~(fd)) << 3) | 3))
++
++static int verbose;
++
++#define pass(name) do { printf("ok - %s\n", (name)); } while (0)
++#define fail(name, ...) do { \
++	printf("not ok - %s: ", (name)); \
++	printf(__VA_ARGS__); \
++	printf("\n"); \
++} while (0)
++#define skip(name, reason) do { printf("ok - %s # SKIP %s\n", (name), (reason)); } while (0)
++
++static clockid_t open_ptp(const char *dev)
++{
++	int fd = open(dev, O_RDWR);
++
++	if (fd < 0) {
++		perror(dev);
++		return CLOCK_INVALID;
++	}
++	return FD_TO_CLOCKID(fd);
++}
++
++static inline int64_t ts_to_ns(const struct timespec *ts)
++{
++	return (int64_t)ts->tv_sec * 1000000000LL + ts->tv_nsec;
++}
++
++/*
++ * Test 1: Monotonicity
++ *
++ * Read the PTP clock 1000 times in quick succession. Each reading
++ * must be >= the previous one. A backward step indicates a bug in
++ * the driver's TSF read path or a locking issue.
++ */
++static int test_monotonicity(clockid_t clk)
++{
++	const char *name = "monotonicity";
++	struct timespec prev, cur;
++	int i;
++
++	if (clock_gettime(clk, &prev)) {
++		fail(name, "initial clock_gettime: %s", strerror(errno));
++		return 1;
++	}
++
++	for (i = 0; i < 1000; i++) {
++		if (clock_gettime(clk, &cur)) {
++			fail(name, "clock_gettime iteration %d: %s",
++			     i, strerror(errno));
++			return 1;
++		}
++		if (ts_to_ns(&cur) < ts_to_ns(&prev)) {
++			fail(name,
++			     "backward step at iteration %d: "
++			     "%lld.%09ld -> %lld.%09ld",
++			     i,
++			     (long long)prev.tv_sec, prev.tv_nsec,
++			     (long long)cur.tv_sec, cur.tv_nsec);
++			return 1;
++		}
++		prev = cur;
++	}
++
++	pass(name);
++	return 0;
++}
++
++/*
++ * Test 2: Set/get round-trip
++ *
++ * Set the clock to a known value, read it back. The read value must
++ * be >= the set value (TSF advanced while we were reading) and within
++ * a reasonable tolerance. Because TSF has microsecond resolution,
++ * sub-µs nanoseconds are truncated on write.
++ */
++static int test_set_get_roundtrip(clockid_t clk)
++{
++	const char *name = "set_get_roundtrip";
++	struct timespec set_ts = { .tv_sec = 1000, .tv_nsec = 0 };
++	struct timespec get_ts;
++	int64_t diff_ns;
++
++	if (clock_settime(clk, &set_ts)) {
++		if (errno == EOPNOTSUPP) {
++			skip(name, "clock_settime not supported (read-only)");
++			return 0;
++		}
++		fail(name, "clock_settime: %s", strerror(errno));
++		return 1;
++	}
++
++	if (clock_gettime(clk, &get_ts)) {
++		fail(name, "clock_gettime after set: %s", strerror(errno));
++		return 1;
++	}
++
++	diff_ns = ts_to_ns(&get_ts) - ts_to_ns(&set_ts);
++
++	/* The read should be >= set (clock advanced), within 100 ms */
++	if (diff_ns < 0) {
++		fail(name,
++		     "clock went backward: set %lld.%09ld, got %lld.%09ld",
++		     (long long)set_ts.tv_sec, set_ts.tv_nsec,
++		     (long long)get_ts.tv_sec, get_ts.tv_nsec);
++		return 1;
++	}
++
++	if (diff_ns > 100000000LL) { /* 100 ms */
++		fail(name,
++		     "excessive drift after set: %" PRId64 " ns "
++		     "(set %lld.%09ld, got %lld.%09ld)",
++		     diff_ns,
++		     (long long)set_ts.tv_sec, set_ts.tv_nsec,
++		     (long long)get_ts.tv_sec, get_ts.tv_nsec);
++		return 1;
++	}
++
++	if (verbose)
++		printf("# roundtrip drift: %" PRId64 " ns\n", diff_ns);
++
++	pass(name);
++	return 0;
++}
++
++/*
++ * Test 3: Adjtime accuracy
++ *
++ * Read clock, apply a +1 second adjustment, read again. The second
++ * reading should be ~1 second ahead of where it would have been.
++ */
++static int test_adjtime(clockid_t clk)
++{
++	const char *name = "adjtime_accuracy";
++	struct timespec before, after;
++	struct timex tx;
++	int64_t delta_ns, expected_ns;
++
++	if (clock_gettime(clk, &before)) {
++		fail(name, "clock_gettime before adj: %s", strerror(errno));
++		return 1;
++	}
++
++	/* Apply +1 second adjustment */
++	memset(&tx, 0, sizeof(tx));
++	tx.modes = ADJ_SETOFFSET;
++	tx.time.tv_sec = 1;
++	tx.time.tv_usec = 0;
++
++	if (clock_adjtime(clk, &tx)) {
++		if (errno == EOPNOTSUPP) {
++			skip(name, "clock_adjtime not supported (read-only)");
++			return 0;
++		}
++		fail(name, "clock_adjtime: %s", strerror(errno));
++		return 1;
++	}
++
++	if (clock_gettime(clk, &after)) {
++		fail(name, "clock_gettime after adj: %s", strerror(errno));
++		return 1;
++	}
++
++	delta_ns = ts_to_ns(&after) - ts_to_ns(&before);
++	expected_ns = 1000000000LL; /* 1 second */
++
++	/*
++	 * Allow 100 ms tolerance: the clock also advanced naturally
++	 * during the adjust, and firmware-based TSF access adds latency.
++	 */
++	if (delta_ns < expected_ns - 100000000LL ||
++	    delta_ns > expected_ns + 100000000LL) {
++		fail(name,
++		     "delta %" PRId64 " ns, expected ~%" PRId64 " ns "
++		     "(tolerance 100 ms)",
++		     delta_ns, expected_ns);
++		return 1;
++	}
++
++	if (verbose)
++		printf("# adjtime delta: %" PRId64 " ns "
++		       "(expected %" PRId64 " ns)\n",
++		       delta_ns, expected_ns);
++
++	pass(name);
++	return 0;
++}
++
++/*
++ * Test 4: Long-running stability
++ *
++ * Read the PTP clock every 100 ms for the configured duration.
++ * Verify that time never goes backward. This catches intermittent
++ * locking bugs, TSF register read races, and firmware timeout issues
++ * that only manifest under sustained operation.
++ */
++static int test_long_running(clockid_t clk, int duration_sec)
++{
++	const char *name = "long_running_stability";
++	struct timespec prev, cur, sleep_ts;
++	int64_t total_reads = 0;
++	int elapsed = 0;
++
++	if (clock_gettime(clk, &prev)) {
++		fail(name, "initial clock_gettime: %s", strerror(errno));
++		return 1;
++	}
++
++	sleep_ts.tv_sec = 0;
++	sleep_ts.tv_nsec = 100000000; /* 100 ms */
++
++	while (elapsed < duration_sec) {
++		nanosleep(&sleep_ts, NULL);
++
++		if (clock_gettime(clk, &cur)) {
++			fail(name,
++			     "clock_gettime failed at t+%d s: %s",
++			     elapsed, strerror(errno));
++			return 1;
++		}
++
++		if (ts_to_ns(&cur) < ts_to_ns(&prev)) {
++			fail(name,
++			     "backward step at t+%d s (read #%" PRId64 "): "
++			     "%lld.%09ld -> %lld.%09ld",
++			     elapsed, total_reads,
++			     (long long)prev.tv_sec, prev.tv_nsec,
++			     (long long)cur.tv_sec, cur.tv_nsec);
++			return 1;
++		}
++
++		prev = cur;
++		total_reads++;
++
++		if (total_reads % 10 == 0)
++			elapsed++;
++	}
++
++	if (verbose)
++		printf("# long-running: %" PRId64 " reads over %d s, "
++		       "no backward steps\n", total_reads, duration_sec);
++
++	pass(name);
++	return 0;
++}
++
++/*
++ * Test 5: Rapid-fire stress
++ *
++ * 10 000 back-to-back clock reads with no sleep. Catches races in
++ * the mutex/MMIO path and verifies the driver handles burst access.
++ */
++static int test_stress(clockid_t clk)
++{
++	const char *name = "rapid_fire_stress";
++	struct timespec ts, prev;
++	int i;
++
++	if (clock_gettime(clk, &prev)) {
++		fail(name, "initial clock_gettime: %s", strerror(errno));
++		return 1;
++	}
++
++	for (i = 0; i < 10000; i++) {
++		if (clock_gettime(clk, &ts)) {
++			fail(name, "clock_gettime at iteration %d: %s",
++			     i, strerror(errno));
++			return 1;
++		}
++		if (ts_to_ns(&ts) < ts_to_ns(&prev)) {
++			fail(name,
++			     "backward step at iteration %d: "
++			     "%lld.%09ld -> %lld.%09ld",
++			     i,
++			     (long long)prev.tv_sec, prev.tv_nsec,
++			     (long long)ts.tv_sec, ts.tv_nsec);
++			return 1;
++		}
++		prev = ts;
++	}
++
++	pass(name);
++	return 0;
++}
++
++static void usage(const char *prog)
++{
++	fprintf(stderr,
++		"Usage: %s <ptp-device> [options]\n"
++		"\n"
++		"Options:\n"
++		"  --duration N   Long-running test duration in seconds (default: 60)\n"
++		"  --quick        Skip long-running test\n"
++		"  --verbose      Print extra diagnostics\n"
++		"\n"
++		"Example:\n"
++		"  modprobe mac80211_hwsim radios=2\n"
++		"  modprobe tsf_ptp\n"
++		"  %s /dev/ptp0\n", prog, prog);
++}
++
++int main(int argc, char **argv)
++{
++	const char *dev = NULL;
++	int duration = 60;
++	int quick = 0;
++	int failures = 0;
++	int total = 0;
++	int i;
++	clockid_t clk;
++
++	for (i = 1; i < argc; i++) {
++		if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
++			duration = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "--quick") == 0) {
++			quick = 1;
++		} else if (strcmp(argv[i], "--verbose") == 0) {
++			verbose = 1;
++		} else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
++			usage(argv[0]);
++			return 0;
++		} else if (argv[i][0] != '-') {
++			dev = argv[i];
++		} else {
++			fprintf(stderr, "Unknown option: %s\n", argv[i]);
++			usage(argv[0]);
++			return 1;
++		}
++	}
++
++	if (!dev) {
++		usage(argv[0]);
++		return 1;
++	}
++
++	clk = open_ptp(dev);
++	if (clk == CLOCK_INVALID)
++		return 1;
++
++	printf("TAP version 13\n");
++	printf("1..%d\n", quick ? 4 : 5);
++
++	total++; failures += test_monotonicity(clk);
++	total++; failures += test_set_get_roundtrip(clk);
++	total++; failures += test_adjtime(clk);
++	total++; failures += test_stress(clk);
++
++	if (!quick) {
++		total++; failures += test_long_running(clk, duration);
++	}
++
++	printf("# %d/%d tests passed\n", total - failures, total);
++	return failures ? 1 : 0;
++}

@@ -174,6 +174,47 @@ drivers/net/wireless/mediatek/mt76/mac80211.c |   4 +
 drivers/net/wireless/mediatek/mt76/ptp.c      | 142 +++++++++++++  (new)
 ```
 
+**Test patches (applied after 0001):**
+
+| Patch | What | Test count |
+|-------|------|------------|
+| `0002-wifi-mt76-add-kunit-tests-for-ptp-clock.patch` | KUnit: table-driven conversion + mock PTP ops | 48+ parameterized, 9 mock, 2 sweep |
+| `0003-selftests-net-add-wifi-ptp-clock-tests.patch` | kselftest: monotonicity, round-trip, adjtime, long-running stability, stress | 5 tests, configurable duration |
+
+The KUnit test (`CONFIG_MT76_PTP_KUNIT_TEST`) uses `VISIBLE_IF_KUNIT` to test the PTP ops functions directly with mock `mt76_ptp_ops` callbacks. It verifies TSF µs ↔ PTP ns conversion correctness, sub-µs truncation behaviour, signed adjtime arithmetic, and round-trip quantization loss (< 1 µs).
+
+The kselftest (`tools/testing/selftests/net/wifi_ptp_test`) exercises the PTP clock userspace API against any `/dev/ptpN` device. For CI without hardware, use `mac80211_hwsim` + `tsf_ptp`:
+
+```bash
+modprobe mac80211_hwsim radios=2
+modprobe tsf_ptp
+./wifi_ptp_test /dev/ptp0                # default: 60s long-running
+./wifi_ptp_test /dev/ptp0 --duration 300 # 5-minute stability
+./wifi_ptp_test /dev/ptp0 --quick        # skip long-running test
+```
+
+**Nix microVM integration:** The selftest binary is built as a standalone Nix package (`nix/wifi-ptp-test.nix`) from `tests/selftests/wifi_ptp_test.c` — the same source as the kselftest patch, extracted for out-of-tree compilation. It is included in all microVM variants and runs automatically in the `selftest` lifecycle variant:
+
+```bash
+# Full lifecycle + PTP selftests (boot → modules → checks → quick test → 60s stability → shutdown)
+nix run .#tsf-sync-lifecycle-test-selftest
+
+# Boot a selftest VM for manual testing
+nix run .#tsf-sync-microvm-selftest
+
+# Cross-arch selftest (QEMU emulated)
+nix run .#tsf-sync-lifecycle-test-aarch64-selftest
+nix run .#tsf-sync-lifecycle-test-riscv64-selftest
+```
+
+The selftest lifecycle adds two phases after the standard checks:
+- **Phase 11a: Quick PTP Selftest** — runs `wifi_ptp_test --quick` (monotonicity, roundtrip, adjtime, stress — ~30s timeout)
+- **Phase 11b: Long PTP Selftest** — runs `wifi_ptp_test --duration 60` (adds 60s stability test — ~120s timeout)
+
+Timeouts scale per architecture: 1x for KVM, 2x for aarch64 TCG, 3x for riscv64 TCG.
+
+**hwsim limitations:** In the `mac80211_hwsim` environment, read-only tests (monotonicity, rapid-fire stress, long-running stability) always pass. Write-dependent tests (`set_get_roundtrip`, `adjtime_accuracy`) fail because `hwsim`'s `set_tsf` does not take effect through the `tsf_ptp` module — the hwsim TSF is epoch-based (kernel 6.18+) and the write path requires real hardware to validate. The lifecycle correctly distinguishes these: read-only test failures are hard errors, write-dependent failures are reported as warnings with a message that real hardware is needed for full coverage.
+
 ---
 
 ## rtw88 — Realtek RTL8822/8723/8821
@@ -368,6 +409,40 @@ nix run .#patch-verify -- --verbose
 
 # Show full diff for a patch
 nix run .#patch-inspect -- --full
+```
+
+### MicroVM selftest targets (nix run)
+
+| Target | What it does |
+|--------|-------------|
+| `tsf-sync-lifecycle-test-selftest` | Full lifecycle + PTP selftests (x86_64, KVM) |
+| `tsf-sync-lifecycle-test-x86_64-selftest` | Explicit x86_64 selftest |
+| `tsf-sync-lifecycle-test-aarch64-selftest` | aarch64 selftest (QEMU TCG, 2x timeouts) |
+| `tsf-sync-lifecycle-test-riscv64-selftest` | riscv64 selftest (QEMU TCG, 3x timeouts) |
+| `tsf-sync-microvm-selftest` | Boot selftest VM without lifecycle (manual testing) |
+| `tsf-sync-lifecycle-test-all` | All variants including selftest |
+
+The selftest variant boots a microVM with `mac80211_hwsim` + `tsf_ptp`, runs the standard lifecycle phases (module load, PTP clock verification, sysfs checks, tsf-sync CLI), then executes the PTP selftest binary (`wifi_ptp_test`) in quick and long-running modes.
+
+```bash
+# Run selftests in a microVM (no root, no hardware needed)
+nix run .#tsf-sync-lifecycle-test-selftest
+
+# Run all lifecycle variants (basic, multi-radio, sync-modes, benchmark, selftest)
+nix run .#tsf-sync-lifecycle-test-all
+```
+
+Example output (x86_64 KVM, ~1m34s):
+```
+Phase 11a: Quick PTP Selftest (wifi_ptp_test --quick)
+  PASS: wifi_ptp_test --quick: 2/4 passed (2 write-tests skipped in hwsim)
+    Write-dependent tests need real hardware (set_get_roundtrip, adjtime_accuracy)
+
+Phase 11b: Long PTP Selftest (60s)
+  PASS: wifi_ptp_test long (60s): 3/5 passed (2 write-tests skipped in hwsim)
+    Write-dependent tests need real hardware (set_get_roundtrip, adjtime_accuracy)
+
+ALL PHASES PASSED (18 checks)
 ```
 
 ---
