@@ -455,9 +455,28 @@ let
       '') patchLib.driverPatches}
       echo ""
 
-      echo "  Stable: $stable_pass/${toString (builtins.length patchLib.driverPatches)} passed"
-      echo "  Latest: $latest_pass/${toString (builtins.length patchLib.driverPatches)} passed"
-      if [ "$stable_fail" -gt 0 ] || [ "$latest_fail" -gt 0 ]; then
+      echo "  Kernel: ${patchLib.kernelSources.net-next.label} (net-next patches)"
+      prepare_kernel_src "$src/kern" "${patchLib.kernelSources.net-next.src}"
+      cd "$src/kern"
+
+      netnext_pass=0
+      netnext_fail=0
+      ${lib.concatMapStringsSep "\n" (drv: ''
+        printf "    %-14s " "${drv.name}"
+        if patch -p1 --dry-run < ${drv.patch} > /dev/null 2>&1; then
+          echo "PASS"
+          netnext_pass=$((netnext_pass + 1))
+        else
+          echo "FAIL"
+          netnext_fail=$((netnext_fail + 1))
+        fi
+      '') patchLib.driverPatchesNetNext}
+      echo ""
+
+      echo "  Stable:   $stable_pass/${toString (builtins.length patchLib.driverPatches)} passed"
+      echo "  Latest:   $latest_pass/${toString (builtins.length patchLib.driverPatches)} passed"
+      echo "  net-next: $netnext_pass/${toString (builtins.length patchLib.driverPatches)} passed"
+      if [ "$stable_fail" -gt 0 ] || [ "$latest_fail" -gt 0 ] || [ "$netnext_fail" -gt 0 ]; then
         echo "  WARNING: some patches may need updating for newer kernels"
       fi
       echo ""

@@ -15,6 +15,7 @@ let
   #   pinned — development target (v6.12), always tested
   #   stable — pkgs.linuxPackages (latest stable from nixpkgs)
   #   latest — pkgs.linuxPackages_latest (bleeding edge from nixpkgs)
+  #   net-next — netdev/net-next development tree (pre-merge networking patches)
   kernelSources = {
     pinned = {
       label = "v6.12";
@@ -28,8 +29,27 @@ let
       label = "latest-${pkgs.linuxPackages_latest.kernel.version}";
       src = pkgs.linuxPackages_latest.kernel.src;
     };
+    # net-next — tracks the netdev/net-next development tree.
+    # WiFi driver patches land here before mainline merge windows.
+    #
+    # To update:
+    #   1. Get the latest commit:
+    #      git ls-remote https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git HEAD
+    #   2. Update `rev` below
+    #   3. Set `hash = ""` — Nix will error with the correct hash
+    #   4. Paste the correct hash
+    net-next = let
+      rev = "3741f8fa004bf598cd5032b0ff240984332d6f05";
+    in {
+      label = "net-next-${builtins.substring 0 12 rev}";
+      src = pkgs.fetchzip {
+        url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/snapshot/${rev}.tar.gz";
+        hash = "sha256-642CQpg8bIsCdioUEsljb/kguHuc8irfD5N+Ed9meEg=";
+      };
+    };
   };
 
+  # Patches targeting pinned v6.12 (development baseline).
   driverPatches = [
     { name = "ath9k-ptp";  patch = ./ath9k/0001-wifi-ath9k-add-ptp-hardware-clock-for-tsf.patch; }
     { name = "mt76-ptp";   patch = ./mt76/0001-wifi-mt76-add-ptp-hardware-clock-for-tsf.patch; }
@@ -38,9 +58,20 @@ let
     { name = "ath10k-ptp"; patch = ./ath10k/0001-wifi-ath10k-add-ptp-hardware-clock-for-tsf.patch; }
     { name = "ath11k-ptp"; patch = ./ath11k/0001-wifi-ath11k-add-ptp-hardware-clock-for-tsf.patch; }
   ];
+
+  # Patches rebased for net-next (submission target).
+  # Start as copies of v6.12 patches; rebase each against the net-next source.
+  driverPatchesNetNext = [
+    { name = "ath9k-ptp";  patch = ./net-next/ath9k/0001-wifi-ath9k-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "mt76-ptp";   patch = ./net-next/mt76/0001-wifi-mt76-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "rtw88-ptp";  patch = ./net-next/rtw88/0001-wifi-rtw88-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "rtw89-ptp";  patch = ./net-next/rtw89/0001-wifi-rtw89-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "ath10k-ptp"; patch = ./net-next/ath10k/0001-wifi-ath10k-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "ath11k-ptp"; patch = ./net-next/ath11k/0001-wifi-ath11k-add-ptp-hardware-clock-for-tsf.patch; }
+  ];
 in
 {
-  inherit pinnedKernelSource kernelSources driverPatches;
+  inherit pinnedKernelSource kernelSources driverPatches driverPatchesNetNext;
 
   # Backward compatibility alias.
   kernelSource = pinnedKernelSource;
@@ -92,7 +123,7 @@ in
   # ── Combined check: all patches apply to the same tree ──────────────
   #
   # Applies all patches sequentially to verify they don't conflict.
-  mkAllPatchesCheck = { kernelSrc ? pinnedKernelSource, srcLabel ? "v6.12" }:
+  mkAllPatchesCheck = { kernelSrc ? pinnedKernelSource, srcLabel ? "v6.12", patches ? driverPatches }:
     pkgs.runCommand "patch-check-all-${srcLabel}" {
       nativeBuildInputs = with pkgs; [ gnupatch gnutar xz ];
     } ''
@@ -106,8 +137,8 @@ in
       ${lib.concatMapStringsSep "\n" (p: ''
         echo "Applying: ${p.name}"
         patch -p1 < ${p.patch}
-      '') driverPatches}
-      echo "PASS: all ${toString (builtins.length driverPatches)} patches apply against ${srcLabel}"
+      '') patches}
+      echo "PASS: all ${toString (builtins.length patches)} patches apply against ${srcLabel}"
       mkdir -p $out
       echo "all" > $out/name
     '';

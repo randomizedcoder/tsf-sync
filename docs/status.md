@@ -34,7 +34,7 @@
   - [x] `gettime64` → `drv_get_tsf()` with spinlock protection
   - [x] `settime64` → `drv_set_tsf()` with spinlock protection
   - [x] `adjtime` → read-modify-write with spinlock protection
-  - [x] `adjfine` → returns `-EOPNOTSUPP` (no tunable oscillators)
+  - [x] `adjfine` → returns 0 (no-op; WiFi cards lack tunable oscillators, accepts silently so phc2sys considers clock adjustable)
   - [x] `getcrosststamp` → bracketed TSF read with `ktime_get_raw()`/`ktime_get_real()`
   - [x] VIF lifecycle tracking via netdevice notifier (NETDEV_UP/DOWN/UNREGISTER)
   - [x] Existing VIF scan at module load time
@@ -118,13 +118,18 @@ Not started. Depends on Phase 1 completion.
 
 ## Phase 3 — Upstream
 
-Not started. Depends on Phase 1 being stable.
+6 per-driver PTP patches exist (ath9k, ath10k, ath11k, mt76, rtw88, rtw89) with format checks, multi-kernel apply verification, KUnit tests (mt76), and kselftest infrastructure. Not yet submitted — patches need rebasing to net-next and real hardware validation before sending to linux-wireless@vger.kernel.org.
 
-- [ ] Prepare per-driver PTP patch (start with mt76 or ath9k)
-- [ ] Engage with kernel maintainers
+- [x] Prepare per-driver PTP patches for 6 drivers (ath9k, ath10k, ath11k, mt76, rtw88, rtw89)
+- [x] KUnit tests for mt76 (48+ parameterized, 9 mock, 2 sweep)
+- [x] kselftest for PTP clock userspace API (monotonicity, stress, stability)
+- [x] Patch format validation (Signed-off-by, subject convention, SPDX, include guards)
+- [x] Multi-kernel apply verification (pinned v6.12, stable, latest, net-next)
+- [ ] Rebase ath11k, mt76, rtw88 patches to net-next (currently fail on 6.18+/6.19)
+- [ ] Real hardware validation (all testing on mac80211_hwsim so far)
+- [ ] Engage with driver subsystem maintainers
 - [ ] Submit to linux-wireless@vger.kernel.org
 - [ ] Iterate on review feedback
-- [ ] Fill in `docs/upstream.md`
 
 ---
 

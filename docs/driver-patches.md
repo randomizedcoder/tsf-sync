@@ -1,38 +1,56 @@
 # Upstream WiFi PTP Patches
 
-We maintain per-driver kernel patches that add PTP hardware clock (`/dev/ptpN`) support to 6 WiFi drivers. Each patch follows the pattern Intel's `iwlwifi` already uses: a self-contained `ptp.c` + `ptp.h` within the driver directory, registering the card's TSF as a PTP clock. Once upstream, these make the out-of-tree `tsf-ptp` module unnecessary for the patched drivers.
+## Problem Statement
 
-All patches are developed against Linux v6.12 (pinned) and verified against stable and latest kernels via Nix infrastructure.
+Multiple co-located WiFi access points running on a single Linux host maintain independent TSF (Timing Synchronization Function) counters. These 64-bit microsecond clocks govern beacon timing, power-save scheduling, and DTIM delivery, but there is no standard kernel interface for userspace to read or adjust them. When APs share a physical host — as in enterprise WiFi concentrators, mesh gateways, and large-venue deployments — desynchronized TSFs cause uncoordinated beaconing and increased co-channel interference.
+
+The Linux PTP subsystem (`ptp_clock_info`) provides a stable in-kernel interface for hardware clocks. Intel's `iwlwifi` driver already registers its device clock as a PTP hardware clock (`drivers/net/wireless/intel/iwlwifi/mvm/ptp.c`), establishing an accepted pattern for WiFi timing. However, no other WiFi driver exposes TSF through PTP, leaving the majority of deployed hardware without a kernel-supported synchronization path.
+
+This patch series extends the iwlwifi pattern to 6 additional WiFi drivers: ath9k, ath10k, ath11k, mt76, rtw88, and rtw89. Each patch is self-contained — a `ptp.c` and `ptp.h` within the driver directory — totaling 130–224 lines per driver. When `CONFIG_PTP_1588_CLOCK` is disabled, the PTP code compiles out entirely with zero impact on existing functionality.
+
+The target users are operators of multi-radio Linux hosts: enterprise WiFi concentrators, mesh deployments with multiple radios per node, large-venue APs, and WiFi timing researchers. By exposing TSF as a PTP clock, existing userspace tools (`phc2sys`, `ptp4l`) can synchronize WiFi clocks without custom kernel modules or driver modifications. Note: 802.11 does not require inter-AP TSF synchronization for client roaming (802.11r/k/v handles that). The benefit is operational — coordinated beaconing, reduced co-channel interference, and tighter timing for multi-radio coordination.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
+- [Proposed Approach](#proposed-approach)
 - [ath9k — Atheros AR9xxx](#ath9k--atheros-ar9xxx)
 - [ath10k — Qualcomm QCA988x/6174](#ath10k--qualcomm-qca988x6174)
 - [ath11k — Qualcomm QCA6390/WCN6855](#ath11k--qualcomm-qca6390wcn6855)
 - [mt76 — MediaTek MT7915/7921/7996](#mt76--mediatek-mt791579217996)
 - [rtw88 — Realtek RTL8822/8723/8821](#rtw88--realtek-rtl882287238821)
 - [rtw89 — Realtek RTL8852/8851](#rtw89--realtek-rtl88528851)
+- [What Can Go Wrong](#what-can-go-wrong)
+- [Testing Status](#testing-status)
+- [Maintenance Considerations](#maintenance-considerations)
+- [Broadcom Status](#broadcom-status)
 - [Common Design Patterns](#common-design-patterns)
-- [Patch Verification](#patch-verification)
 - [Nix Targets Reference](#nix-targets-reference)
 - [Applying Patches Manually](#applying-patches-manually)
 - [Relationship to tsf-ptp Module](#relationship-to-tsf-ptp-module)
 
 ---
 
-## Overview
+## Proposed Approach
+
+Each patch registers the WiFi card's TSF counter as a PTP hardware clock (`/dev/ptpN`), following the pattern already established by iwlwifi.
+
+**Why PTP clock API:**
+- Stable in-kernel ABI — `ptp_clock_info` is a well-maintained interface, no new UAPI surface required
+- Reuses existing userspace tools (`phc2sys` for local sync, `ptp4l` for network sync) — no custom daemons
+- 130–224 lines per driver — minimal footprint, self-contained within each driver directory
+
+**How it differs from iwlwifi:** These patches expose TSF directly (register reads or firmware commands). iwlwifi uses the GP2 timer with firmware-assisted TSF mapping, since its firmware architecture separates the two clocks.
 
 | Driver | Chipsets | TSF Access | PTP Ops | Kernel Versions |
 |--------|----------|------------|---------|-----------------|
-| ath9k | AR9xxx | Register (AR_TSF_L32/U32) | get/set/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
-| ath10k | QCA988x, QCA6174, QCA9377, QCA9984 | WMI firmware | get/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
-| ath11k | QCA6390, QCN9074, WCN6855, IPQ8074 | WMI firmware | adj only | v6.12 ✓, 6.18 ✗, 6.19 ✗ |
-| mt76 | MT7915/7916/7986, MT7996, MT7921/7922/7925 | Per-chipset callbacks | get/set/adj + crosststamp | v6.12 ✓, 6.18 ✓, 6.19 ✗ |
-| rtw88 | RTL8822BE/CE, RTL8723DE, RTL8821CE | Register (0x0560/0x0564) | get/set/adj | v6.12 ✓, 6.18 ✗, 6.19 ✗ |
-| rtw89 | RTL8852AE/BE, RTL8851BE | Register (R_AX_TSFTR_P0) | get/set/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
+| ath9k | AR9xxx | Register (AR_TSF_L32/U32) | get/set/adj | v6.12 ✓, net-next ✓ |
+| ath10k | QCA988x, QCA6174, QCA9377, QCA9984 | WMI firmware | get/adj | v6.12 ✓, net-next ✓ |
+| ath11k | QCA6390, QCN9074, WCN6855, IPQ8074 | WMI firmware | adj only | v6.12 ✓, net-next ✓ |
+| mt76 | MT7915/7916/7986, MT7996, MT7921/7922/7925 | Per-chipset callbacks | get/set/adj + crosststamp | v6.12 ✓, net-next ✓ |
+| rtw88 | RTL8822BE/CE, RTL8723DE, RTL8821CE | Register (0x0560/0x0564) | get/set/adj | v6.12 ✓, net-next ✓ |
+| rtw89 | RTL8852AE/BE, RTL8851BE | Register (R_AX_TSFTR_P0) | get/set/adj | v6.12 ✓, net-next ✓ |
 
 **Access latency tiers:**
 - **Register-based** (ath9k, rtw88, rtw89): 1–10 µs round-trip via MMIO
@@ -281,6 +299,101 @@ drivers/net/wireless/realtek/rtw89/ptp.h    |  17 +++  (new)
 
 ---
 
+## What Can Go Wrong
+
+| Failure Mode | Impact | Drivers | Mitigation |
+|---|---|---|---|
+| **TSF discontinuity on connected clients** | Power-save clients use TSF/DTIM for beacon wakeups. A TSF jump can cause missed DTIM windows, delayed frame delivery, or client disassociation. | All | Threshold filter: skip `set_tsf` when offset < 5 µs. Initial convergence may cause one missed DTIM window; corrections are µs-scale once converged. |
+| **Firmware state interference** | During active scanning, CSA, or firmware recovery, `get_tsf`/`set_tsf` may return stale data, block, or fail silently. Firmware crash resets TSF counter entirely. | ath10k, ath11k, mt76 (firmware-based) | Return `-EIO` when `get_tsf` returns 0. PTP tools retry automatically. Document that TSF reads during scan may be from the home channel. |
+| **Read-modify-write TOCTOU race** | `adjtime` does read → add offset → write. TSF advances between read and write. Error equals read-write latency. | Register-based (ath9k, rtw88, rtw89): 1–10 µs error. Firmware-based (ath10k, mt76 MCU): 100–500 µs error. | ath10k avoids this via atomic `WMI inc_tsf/dec_tsf`. For others, error is bounded and corrected on next cycle. No driver implements `offset_tsf`. |
+| **`set_tsf` semantics vary per driver** | Some drivers set TSF immediately (register-write). Some may defer to next TBTT (up to 102.4 ms delay). Some may truncate or round. | Varies per driver | Document known behavior per driver. Register-based drivers (ath9k, rtw88, rtw89) are immediate. Firmware-based behavior depends on firmware implementation. |
+| **PCIe bus / firmware queue saturation** | At 100 cards polled at 10 Hz = 1000 PCIe transactions/sec. May hit firmware command queue depth limits. | ath10k, ath11k (WMI queue depth) | Configure per-clock poll intervals. Threshold filter reduces steady-state writes. Use multiple `ptp4l` instances at scale. |
+| **802.11r FT roaming collision** | `set_tsf` during active FT handshake could cause timing inconsistency in reassociation response. | All | Low probability: FT completes in <50 ms, TSF corrections at 100 ms intervals, correction magnitude is µs. |
+| **ptp4l with many WiFi clocks** | `ptp4l` designed for 1–4 clocks. Behavior at 100 untested upstream. | N/A (userspace) | Use `phc2sys` directly for local sync (no ptp4l needed for single-host). |
+| **Hot-unplug mid-operation** | PCIe removal between `get_tsf` read and `set_tsf` write. | All | Driver mutex protects ops. Underlying driver returns error on removed device. PTP clock unregistered via netdev notifier. |
+
+---
+
+## Testing Status
+
+### Tested
+
+- **Patch format validation** — Signed-off-by, subject convention, SPDX, include guards, no trailing whitespace
+- **Patch application** — dry-run against pinned v6.12, stable, latest, and net-next kernels
+- **Sequential application** — all 6 patches to a single tree, no conflicts
+- **KUnit tests** for mt76 — 48+ parameterized, 9 mock, 2 sweep tests
+- **kselftest** for PTP clock userspace API — monotonicity, stress, stability (read-only tests pass on hwsim)
+- **MicroVM lifecycle tests** — boot → module load → PTP verify → selftests → shutdown
+
+### NOT tested
+
+- **Real hardware.** All tests use `mac80211_hwsim`. The write path (`set_tsf`) has never been validated on any of the 6 targeted chipsets.
+- **Write-dependent selftests** fail on hwsim (`set_get_roundtrip`, `adjtime_accuracy`)
+- **Firmware interactions** — scanning, channel switch, recovery
+- **Client impact** — power save, DTIM, roaming behavior during TSF adjustment
+- **Scale with real hardware** — hwsim only, not 100 real cards
+
+### Per-driver test coverage
+
+| Driver | KUnit | kselftest | Real hardware |
+|--------|-------|-----------|---------------|
+| mt76 | Yes (48+ tests) | Yes | No |
+| ath9k | No | No | No |
+| ath10k | No | No | No |
+| ath11k | No | No | No |
+| rtw88 | No | No | No |
+| rtw89 | No | No | No |
+
+### Multi-kernel results
+
+Run the full test suite to see current results:
+
+```bash
+nix run .#patch-test-all
+```
+
+Example output (results depend on current nixpkgs kernel versions):
+
+| Driver | v6.12 (pinned) | stable (6.18.x) | latest (6.19.x) | net-next |
+|--------|:--------------:|:----------------:|:----------------:|:--------:|
+| ath9k | ✓ | ✓ | ✓ | ✓ |
+| ath10k | ✓ | ✓ | ✓ | ✓ |
+| ath11k | ✓ | ✗ | ✗ | ✓ |
+| mt76 | ✓ | ✓ | ✗ | ✓ |
+| rtw88 | ✓ | ✗ | ✗ | ✓ |
+| rtw89 | ✓ | ✓ | ✓ | ✓ |
+
+Failures against newer kernels indicate upstream driver changes that require patch updates. The pinned v6.12 source is the development target — all 6 patches always apply there. The net-next patches (`patches/net-next/<driver>/`) are rebased against `netdev/net-next` at commit `3741f8fa004b` and apply cleanly.
+
+### What the test suite checks
+
+The `patch-test-all` script runs 4 phases:
+
+1. **Format checks** — Signed-off-by present, `wifi: <driver>:` subject convention, SPDX headers, include guards, no trailing whitespace
+2. **Apply verification** — `patch -p1 --dry-run` against pinned, stable, latest, and net-next kernel sources
+3. **Conflict detection** — Sequential application of all 6 patches to a single tree to verify they don't conflict
+4. **Patch statistics** — Lines added/removed per driver
+
+---
+
+## Maintenance Considerations
+
+- **ABI stability**: `ptp_clock_info` is a stable in-kernel interface. No new UAPI surface.
+- **Backward compatibility**: `PTP_1588_CLOCK_OPTIONAL` means PTP code compiles out entirely when disabled. Zero impact on existing driver functionality.
+- **Per-driver isolation**: Each patch adds 130–224 lines in its own `ptp.c`/`ptp.h`. No shared infrastructure between drivers. Each driver subsystem maintainer owns their `ptp.c`.
+- **Independent review**: Each patch can be reviewed and merged independently. No cross-driver dependencies.
+- **Precedent**: iwlwifi's `ptp.c` has been maintained since ~5.19 with minimal churn.
+
+---
+
+## Broadcom Status
+
+- **brcmfmac** (BCM4339, BCM43455, etc.): FullMAC driver. Firmware owns TSF entirely. No `get_tsf`/`set_tsf` in `ieee80211_ops`. Cannot be patched without Broadcom firmware changes. Not targeted.
+- **brcmsmac** (BCM4313, BCM43224, etc.): Legacy SoftMAC. Has TSF register access. Supported by out-of-tree `tsf-ptp` module. Not in upstream patch series (EOL hardware).
+- **b43** (BCM4306, BCM4311, etc.): Legacy SoftMAC. Same as brcmsmac.
+
+---
+
 ## Common Design Patterns
 
 All 6 patches follow the same architecture established by `iwlwifi`'s [ptp.c](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/intel/iwlwifi/mvm/ptp.c):
@@ -321,42 +434,6 @@ static inline void ath9k_ptp_init(struct ath_softc *sc) {}
 
 ---
 
-## Patch Verification
-
-All patches are developed against a pinned Linux v6.12 source tree (fetched via `fetchFromGitHub` in `patches/kernel-source.nix`). The Nix infrastructure also tests against nixpkgs' stable and latest kernel sources to detect upstream breakage early.
-
-### Multi-kernel results
-
-Run the full test suite to see current results:
-
-```bash
-nix run .#patch-test-all
-```
-
-Example output (results depend on current nixpkgs kernel versions):
-
-| Driver | v6.12 (pinned) | stable (6.18.x) | latest (6.19.x) |
-|--------|:--------------:|:----------------:|:----------------:|
-| ath9k | ✓ | ✓ | ✓ |
-| ath10k | ✓ | ✓ | ✓ |
-| ath11k | ✓ | ✗ | ✗ |
-| mt76 | ✓ | ✓ | ✗ |
-| rtw88 | ✓ | ✗ | ✗ |
-| rtw89 | ✓ | ✓ | ✓ |
-
-Failures against newer kernels indicate upstream driver changes that require patch updates. The pinned v6.12 source is the development target — all 6 patches always apply there.
-
-### What the test suite checks
-
-The `patch-test-all` script runs 4 phases:
-
-1. **Format checks** — Signed-off-by present, `wifi: <driver>:` subject convention, SPDX headers, include guards, no trailing whitespace
-2. **Apply verification** — `patch -p1 --dry-run` against pinned, stable, and latest kernel sources
-3. **Conflict detection** — Sequential application of all 6 patches to a single tree to verify they don't conflict
-4. **Patch statistics** — Lines added/removed per driver
-
----
-
 ## Nix Targets Reference
 
 ### Declarative checks (nix build)
@@ -366,9 +443,11 @@ The `patch-test-all` script runs 4 phases:
 | `patch-check-<driver>` | Verify patch applies to pinned v6.12 |
 | `patch-check-<driver>-stable` | Verify patch applies to stable kernel |
 | `patch-check-<driver>-latest` | Verify patch applies to latest kernel |
+| `patch-check-<driver>-net-next` | Verify patch applies to net-next kernel |
 | `patch-check-all` | All 6 patches on pinned v6.12 (sequential) |
 | `patch-check-all-stable` | All 6 patches on stable kernel |
 | `patch-check-all-latest` | All 6 patches on latest kernel |
+| `patch-check-all-net-next` | All 6 patches on net-next kernel |
 | `patch-kernel-<driver>` | Full kernel build with one patch applied |
 
 Driver names: `ath9k-ptp`, `ath10k-ptp`, `ath11k-ptp`, `mt76-ptp`, `rtw88-ptp`, `rtw89-ptp`.
@@ -379,6 +458,9 @@ nix build .#patch-check-ath9k-ptp
 
 # Check all patches against stable kernel
 nix build .#patch-check-all-stable
+
+# Check all patches against net-next
+nix build .#patch-check-all-net-next
 
 # Full kernel build with mt76 patch (slow, cached)
 nix build .#patch-kernel-mt76-ptp
