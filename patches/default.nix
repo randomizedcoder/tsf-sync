@@ -55,6 +55,19 @@ let
     };
   };
 
+  # KUnit test patch checks (sequential: 0001 + 0002) against v6.12.
+  kunitChecks = builtins.listToAttrs (map (drv:
+    lib.nameValuePair "patch-check-${drv.name}" (patchLib.mkSequentialPatchCheck drv)
+  ) patchLib.kunitPatches);
+
+  # KUnit test patch checks against net-next.
+  kunitChecksNetNext = builtins.listToAttrs (map (drv:
+    lib.nameValuePair "patch-check-${drv.name}-net-next" (patchLib.mkSequentialPatchCheck (drv // {
+      kernelSrc = patchLib.kernelSources.net-next.src;
+      srcLabel = patchLib.kernelSources.net-next.label;
+    }))
+  ) patchLib.kunitPatchesNetNext);
+
   # Per-driver full kernel builds (slow, cached).
   perDriverKernels = builtins.listToAttrs (map (drv:
     lib.nameValuePair "patch-kernel-${drv.name}" (patchLib.mkPatchedKernel drv)
@@ -63,7 +76,9 @@ let
 in
 {
   packages = perDriverChecks // perDriverChecksStable // perDriverChecksLatest
-    // perDriverChecksNetNext // allChecks // perDriverKernels;
+    // perDriverChecksNetNext // allChecks
+    // kunitChecks // kunitChecksNetNext
+    // perDriverKernels;
   inherit (patchLib) driverPatches kernelSource kernelSources;
   patchedKernel = patchLib.mkAllPatchedKernel {};
 }

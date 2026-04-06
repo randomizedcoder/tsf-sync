@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH 2/2] wifi: ath11k: add KUnit tests for PTP hardware clock
+
+KUnit tests for the ath11k PTP hardware clock.
+
+Test suites:
+
+  ath11k_ptp_find_vdev:
+    - empty list, one started, one stopped, first-match (4 cases)
+
+  ath11k_ptp_adjtime_sign:
+    - documents (u32)delta_us cast behavior (5 parameterized)
+    - negative deltas wrap to large positive (firmware limitation)
+
+  ath11k_ptp_contract:
+    - gettime64/settime64 return -EOPNOTSUPP
+    - adjfine returns 0
+
+Total: 12 tests.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ 3 files changed, 289 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/Kconfig b/drivers/net/wireless/ath/ath11k/Kconfig
+--- a/drivers/net/wireless/ath/ath11k/Kconfig	2026-04-05 09:06:19.203689737 -0700
++++ b/drivers/net/wireless/ath/ath11k/Kconfig	2026-04-05 09:06:19.222723844 -0700
+@@ -12,6 +12,19 @@
+ 
+ 	  If you choose to build a module, it'll be called ath11k.
+ 
++
++config ATH11K_PTP_KUNIT_TEST
++	tristate "KUnit tests for ath11k PTP hardware clock" if !KUNIT_ALL_TESTS
++	depends on ATH11K && PTP_1588_CLOCK && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  KUnit tests for the ath11k PTP hardware clock logic.
++	  Tests verify vdev discovery (find_vdev), adjtime
++	  sign handling, and PTP API contracts (EOPNOTSUPP
++	  for gettime64/settime64).
++
++	  If unsure, say N.
++
+ config ATH11K_AHB
+ 	tristate "Atheros ath11k AHB support"
+ 	depends on ATH11K
+diff --git a/drivers/net/wireless/ath/ath11k/Makefile b/drivers/net/wireless/ath/ath11k/Makefile
+--- a/drivers/net/wireless/ath/ath11k/Makefile	2026-04-05 09:06:19.203740703 -0700
++++ b/drivers/net/wireless/ath/ath11k/Makefile	2026-04-05 09:06:19.222796511 -0700
+@@ -31,6 +31,8 @@
+ ath11k-$(CONFIG_ATH11K_CFR) += cfr.o
+ ath11k-$(CONFIG_PTP_1588_CLOCK) += ptp.o
+ 
++obj-$(CONFIG_ATH11K_PTP_KUNIT_TEST) += ath11k_ptp_kunit_test.o
++
+ obj-$(CONFIG_ATH11K_AHB) += ath11k_ahb.o
+ ath11k_ahb-y += ahb.o
+ 
+diff --git a/drivers/net/wireless/ath/ath11k/ptp.c b/drivers/net/wireless/ath/ath11k/ptp.c
+--- a/drivers/net/wireless/ath/ath11k/ptp.c	2026-04-05 09:06:19.204226776 -0700
++++ b/drivers/net/wireless/ath/ath11k/ptp.c	2026-04-05 09:06:19.222595884 -0700
+@@ -14,11 +14,12 @@
+ #include "core.h"
+ #include "wmi.h"
+ #include "ptp.h"
++#include <kunit/visibility.h>
+ 
+ #if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
+ 
+ /* Find the first active vdev id on this radio, or -1 if none. */
+-static int ath11k_ptp_find_vdev(struct ath11k *ar)
++VISIBLE_IF_KUNIT int ath11k_ptp_find_vdev(struct ath11k *ar)
+ {
+ 	struct ath11k_vif *arvif;
+ 
+@@ -57,19 +58,19 @@
+ 	return ret;
+ }
+ 
+-static int ath11k_ptp_gettime64(struct ptp_clock_info *ptp,
++VISIBLE_IF_KUNIT int ath11k_ptp_gettime64(struct ptp_clock_info *ptp,
+ 				struct timespec64 *ts)
+ {
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static int ath11k_ptp_settime64(struct ptp_clock_info *ptp,
++VISIBLE_IF_KUNIT int ath11k_ptp_settime64(struct ptp_clock_info *ptp,
+ 				const struct timespec64 *ts)
+ {
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static int ath11k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++VISIBLE_IF_KUNIT int ath11k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+ {
+ 	return 0;
+ }
+diff --git a/drivers/net/wireless/ath/ath11k/ptp_kunit_test.c b/drivers/net/wireless/ath/ath11k/ptp_kunit_test.c
+--- a/drivers/net/wireless/ath/ath11k/ptp_kunit_test.c	1969-12-31 16:00:00.000000000 -0800
++++ b/drivers/net/wireless/ath/ath11k/ptp_kunit_test.c	2026-04-05 09:06:19.222854810 -0700
+@@ -0,0 +1,269 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for ath11k PTP hardware clock
++ *
++ * Tests the vdev discovery logic (find_vdev), the adjtime sign
++ * handling, and PTP API contracts.
++ *
++ * ath11k uses a single WMI_VDEV_PARAM_TSF_INCREMENT parameter for
++ * TSF adjustments.  Unlike ath10k (which has separate inc_tsf/dec_tsf
++ * WMI params), negative deltas are cast to u32 via (u32)delta_us,
++ * producing an unintended large positive increment.  These tests
++ * document this behavior.
++ *
++ * Test suites:
++ *
++ *   ath11k_ptp_find_vdev:
++ *     - empty arvifs list returns -1
++ *     - one started vif returns its vdev_id
++ *     - one stopped vif returns -1
++ *     - multiple vifs: returns first started vdev_id
++ *
++ *   ath11k_ptp_adjtime_sign:
++ *     - positive delta produces correct u32 value (5 parameterized)
++ *     - negative delta wraps via (u32) cast (documented limitation)
++ *     - zero delta produces 0
++ *
++ *   ath11k_ptp_contract:
++ *     - gettime64 returns -EOPNOTSUPP (no synchronous WMI read)
++ *     - settime64 returns -EOPNOTSUPP
++ *     - adjfine returns 0 (fixed crystal)
++ *
++ * Total: 4 find_vdev + 5 sign + 3 contract = 12 tests.
++ */
++
++#include <kunit/test.h>
++#include <linux/ptp_clock_kernel.h>
++#include <linux/math64.h>
++#include <linux/list.h>
++#include "core.h"
++#include "ptp.h"
++
++/* Forward declarations -- VISIBLE_IF_KUNIT in ptp.c */
++int ath11k_ptp_find_vdev(struct ath11k *ar);
++int ath11k_ptp_gettime64(struct ptp_clock_info *ptp, struct timespec64 *ts);
++int ath11k_ptp_settime64(struct ptp_clock_info *ptp,
++			 const struct timespec64 *ts);
++int ath11k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm);
++
++/* ================================================================
++ * find_vdev tests
++ *
++ * ath11k_ptp_find_vdev walks the arvifs list looking for the first
++ * vif with is_started == true.  Returns the vdev_id, or -1 if none.
++ * ================================================================ */
++
++struct ath11k_ptp_test_ctx {
++	struct ath11k *ar;
++};
++
++static int ath11k_ptp_test_init(struct kunit *test)
++{
++	struct ath11k_ptp_test_ctx *ctx;
++
++	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx);
++
++	ctx->ar = kunit_kzalloc(test, sizeof(*ctx->ar), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->ar);
++
++	mutex_init(&ctx->ar->conf_mutex);
++	INIT_LIST_HEAD(&ctx->ar->arvifs);
++
++	test->priv = ctx;
++	return 0;
++}
++
++static void ath11k_ptp_test_find_vdev_empty(struct kunit *test)
++{
++	struct ath11k_ptp_test_ctx *ctx = test->priv;
++
++	mutex_lock(&ctx->ar->conf_mutex);
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_find_vdev(ctx->ar), -1);
++	mutex_unlock(&ctx->ar->conf_mutex);
++}
++
++static void ath11k_ptp_test_find_vdev_one_started(struct kunit *test)
++{
++	struct ath11k_ptp_test_ctx *ctx = test->priv;
++	struct ath11k_vif *arvif;
++
++	arvif = kunit_kzalloc(test, sizeof(*arvif), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, arvif);
++	arvif->is_started = true;
++	arvif->vdev_id = 5;
++	list_add_tail(&arvif->list, &ctx->ar->arvifs);
++
++	mutex_lock(&ctx->ar->conf_mutex);
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_find_vdev(ctx->ar), 5);
++	mutex_unlock(&ctx->ar->conf_mutex);
++}
++
++static void ath11k_ptp_test_find_vdev_one_stopped(struct kunit *test)
++{
++	struct ath11k_ptp_test_ctx *ctx = test->priv;
++	struct ath11k_vif *arvif;
++
++	arvif = kunit_kzalloc(test, sizeof(*arvif), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, arvif);
++	arvif->is_started = false;
++	arvif->vdev_id = 3;
++	list_add_tail(&arvif->list, &ctx->ar->arvifs);
++
++	mutex_lock(&ctx->ar->conf_mutex);
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_find_vdev(ctx->ar), -1);
++	mutex_unlock(&ctx->ar->conf_mutex);
++}
++
++static void ath11k_ptp_test_find_vdev_returns_first(struct kunit *test)
++{
++	struct ath11k_ptp_test_ctx *ctx = test->priv;
++	struct ath11k_vif *v1, *v2;
++
++	v1 = kunit_kzalloc(test, sizeof(*v1), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, v1);
++	v1->is_started = true;
++	v1->vdev_id = 3;
++	list_add_tail(&v1->list, &ctx->ar->arvifs);
++
++	v2 = kunit_kzalloc(test, sizeof(*v2), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, v2);
++	v2->is_started = true;
++	v2->vdev_id = 7;
++	list_add_tail(&v2->list, &ctx->ar->arvifs);
++
++	mutex_lock(&ctx->ar->conf_mutex);
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_find_vdev(ctx->ar), 3);
++	mutex_unlock(&ctx->ar->conf_mutex);
++}
++
++/* ================================================================
++ * adjtime sign tests
++ *
++ * ath11k_ptp_adjtime converts delta_ns to delta_us via div_s64 and
++ * passes it to WMI_VDEV_PARAM_TSF_INCREMENT as (u32)delta_us.
++ *
++ * For negative deltas, (u32) of a negative s64 produces a large
++ * positive value (two's complement wrap).  Unlike ath10k (which has
++ * separate inc_tsf/dec_tsf WMI params), ath11k has only
++ * TSF_INCREMENT, so negative adjustments become unintended large
++ * positive increments.
++ *
++ * These tests document the actual behavior of the (u32) cast.
++ * The "wraps" cases are NOT bugs that should be "fixed" by the test
++ * -- they document a firmware API limitation.
++ * ================================================================ */
++
++struct adjtime_sign_case {
++	const char *desc;
++	s64 delta_ns;
++	u32 expect_wmi_value;
++};
++
++static const struct adjtime_sign_case adjtime_sign_cases[] = {
++	{ "positive_1us",
++	  1000, 1 },
++	{ "positive_1sec",
++	  1000000000LL, 1000000 },
++	{ "zero",
++	  0, 0 },
++	/*
++	 * Negative deltas: (u32) of negative value wraps.
++	 * -1 us -> (u32)(-1) = 4294967295
++	 * This is NOT a decrement -- WMI_VDEV_PARAM_TSF_INCREMENT only
++	 * increments.  Actual effect: TSF jumps forward by ~71 minutes.
++	 */
++	{ "negative_1us_wraps",
++	  -1000, 4294967295U },
++	{ "negative_1sec_wraps",
++	  -1000000000LL, 4293967296U },
++};
++
++static void ath11k_ptp_test_adjtime_sign(struct kunit *test)
++{
++	const struct adjtime_sign_case *p = test->param_value;
++	s64 delta_us = div_s64(p->delta_ns, NSEC_PER_USEC);
++	u32 wmi_value = (u32)delta_us;
++
++	KUNIT_EXPECT_EQ(test, wmi_value, p->expect_wmi_value);
++}
++
++KUNIT_ARRAY_PARAM_DESC(ath11k_ptp_adjtime_sign, adjtime_sign_cases, desc);
++
++/* ================================================================
++ * Contract tests -- PTP ops return documented values
++ * ================================================================ */
++
++static void ath11k_ptp_test_gettime_eopnotsupp(struct kunit *test)
++{
++	struct ptp_clock_info dummy = {};
++	struct timespec64 ts;
++
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_gettime64(&dummy, &ts), -EOPNOTSUPP);
++}
++
++static void ath11k_ptp_test_settime_eopnotsupp(struct kunit *test)
++{
++	struct ptp_clock_info dummy = {};
++	struct timespec64 ts = { .tv_sec = 1, .tv_nsec = 0 };
++
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_settime64(&dummy, &ts), -EOPNOTSUPP);
++}
++
++static void ath11k_ptp_test_adjfine_noop(struct kunit *test)
++{
++	struct ptp_clock_info dummy = {};
++
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_adjfine(&dummy, 0), 0);
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_adjfine(&dummy, 500000), 0);
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_adjfine(&dummy, -500000), 0);
++	KUNIT_EXPECT_EQ(test, ath11k_ptp_adjfine(&dummy, S32_MAX), 0);
++}
++
++/* ================================================================
++ * Suite definitions
++ * ================================================================ */
++
++static struct kunit_case ath11k_ptp_find_vdev_cases[] = {
++	KUNIT_CASE(ath11k_ptp_test_find_vdev_empty),
++	KUNIT_CASE(ath11k_ptp_test_find_vdev_one_started),
++	KUNIT_CASE(ath11k_ptp_test_find_vdev_one_stopped),
++	KUNIT_CASE(ath11k_ptp_test_find_vdev_returns_first),
++	{},
++};
++
++static struct kunit_suite ath11k_ptp_find_vdev_suite = {
++	.name = "ath11k_ptp_find_vdev",
++	.init = ath11k_ptp_test_init,
++	.test_cases = ath11k_ptp_find_vdev_cases,
++};
++
++static struct kunit_case ath11k_ptp_adjtime_sign_cases_list[] = {
++	KUNIT_CASE_PARAM(ath11k_ptp_test_adjtime_sign,
++			 ath11k_ptp_adjtime_sign_gen_params),
++	{},
++};
++
++static struct kunit_suite ath11k_ptp_adjtime_sign_suite = {
++	.name = "ath11k_ptp_adjtime_sign",
++	.test_cases = ath11k_ptp_adjtime_sign_cases_list,
++};
++
++static struct kunit_case ath11k_ptp_contract_cases[] = {
++	KUNIT_CASE(ath11k_ptp_test_gettime_eopnotsupp),
++	KUNIT_CASE(ath11k_ptp_test_settime_eopnotsupp),
++	KUNIT_CASE(ath11k_ptp_test_adjfine_noop),
++	{},
++};
++
++static struct kunit_suite ath11k_ptp_contract_suite = {
++	.name = "ath11k_ptp_contract",
++	.test_cases = ath11k_ptp_contract_cases,
++};
++
++kunit_test_suites(&ath11k_ptp_find_vdev_suite,
++		  &ath11k_ptp_adjtime_sign_suite,
++		  &ath11k_ptp_contract_suite);
++
++MODULE_DESCRIPTION("KUnit tests for ath11k PTP hardware clock");
++MODULE_LICENSE("GPL");

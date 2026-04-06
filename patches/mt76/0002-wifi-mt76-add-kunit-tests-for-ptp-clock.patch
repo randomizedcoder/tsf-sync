@@ -49,10 +49,10 @@ Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
 diff --git a/drivers/net/wireless/mediatek/mt76/Kconfig b/drivers/net/wireless/mediatek/mt76/Kconfig
 --- a/drivers/net/wireless/mediatek/mt76/Kconfig
 +++ b/drivers/net/wireless/mediatek/mt76/Kconfig
-@@ -1,6 +1,18 @@
- config MT76_CORE
+@@ -3,6 +3,19 @@
  	tristate
-
+ 	select PAGE_POOL
+ 
 +config MT76_PTP_KUNIT_TEST
 +	tristate "KUnit tests for mt76 PTP hardware clock" if !KUNIT_ALL_TESTS
 +	depends on MT76_CORE && PTP_1588_CLOCK && KUNIT
@@ -73,11 +73,11 @@ diff --git a/drivers/net/wireless/mediatek/mt76/ptp.c b/drivers/net/wireless/med
 --- a/drivers/net/wireless/mediatek/mt76/ptp.c
 +++ b/drivers/net/wireless/mediatek/mt76/ptp.c
 @@ -16,8 +16,18 @@
-
+ 
  #include <linux/ptp_clock_kernel.h>
  #include "mt76.h"
 +#include <kunit/visibility.h>
-
+ 
 -static int mt76_ptp_gettime64(struct ptp_clock_info *ptp,
 +/*
 + * VISIBLE_IF_KUNIT makes these functions non-static when CONFIG_KUNIT
@@ -95,7 +95,7 @@ diff --git a/drivers/net/wireless/mediatek/mt76/ptp.c b/drivers/net/wireless/med
 @@ -34,7 +44,7 @@ static int mt76_ptp_gettime64(struct ptp_clock_info *ptp,
  	return 0;
  }
-
+ 
 -static int mt76_ptp_settime64(struct ptp_clock_info *ptp,
 +VISIBLE_IF_KUNIT int mt76_ptp_settime64(struct ptp_clock_info *ptp,
  			      const struct timespec64 *ts)
@@ -104,7 +104,7 @@ diff --git a/drivers/net/wireless/mediatek/mt76/ptp.c b/drivers/net/wireless/med
 @@ -52,7 +62,7 @@ static int mt76_ptp_settime64(struct ptp_clock_info *ptp,
  	return 0;
  }
-
+ 
 -static int mt76_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
 +VISIBLE_IF_KUNIT int mt76_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
  {
@@ -113,14 +113,14 @@ diff --git a/drivers/net/wireless/mediatek/mt76/ptp.c b/drivers/net/wireless/med
 @@ -70,7 +80,7 @@ static int mt76_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta_ns)
  	return 0;
  }
-
+ 
 -static int mt76_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
 +VISIBLE_IF_KUNIT int mt76_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
  {
  	/* WiFi cards have fixed oscillators -- no frequency tuning. */
  	return 0;
-@@ -78,7 +88,7 @@ static int mt76_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
-
+@@ -78,5 +88,5 @@ static int mt76_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+ 
 -static int mt76_ptp_getcrosststamp(struct ptp_clock_info *ptp,
 +VISIBLE_IF_KUNIT int mt76_ptp_getcrosststamp(struct ptp_clock_info *ptp,
  				   struct system_device_crosststamp *cts)
@@ -135,7 +135,7 @@ diff --git a/drivers/net/wireless/mediatek/mt76/Makefile b/drivers/net/wireless/
  mt76-$(CONFIG_PTP_1588_CLOCK) += ptp.o
 +
 +obj-$(CONFIG_MT76_PTP_KUNIT_TEST) += mt76_ptp_kunit_test.o
-
+ 
  mt76-usb-y := usb.o usb_trace.o
  mt76-sdio-y := sdio.o sdio_txrx.o
 diff --git a/drivers/net/wireless/mediatek/mt76/ptp_kunit_test.c b/drivers/net/wireless/mediatek/mt76/ptp_kunit_test.c
