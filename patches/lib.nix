@@ -69,9 +69,42 @@ let
     { name = "ath10k-ptp"; patch = ./net-next/ath10k/0001-wifi-ath10k-add-ptp-hardware-clock-for-tsf.patch; }
     { name = "ath11k-ptp"; patch = ./net-next/ath11k/0001-wifi-ath11k-add-ptp-hardware-clock-for-tsf.patch; }
   ];
+
+  # KUnit test patches (must be applied after corresponding 0001 patches).
+  # Each entry contains the prerequisite 0001 + the 0002 KUnit patch.
+  kunitPatches = [
+    { name = "mt76-kunit";  patches = [
+      ./mt76/0001-wifi-mt76-add-ptp-hardware-clock-for-tsf.patch
+      ./mt76/0002-wifi-mt76-add-kunit-tests-for-ptp-clock.patch
+    ]; }
+    { name = "ath10k-kunit"; patches = [
+      ./ath10k/0001-wifi-ath10k-add-ptp-hardware-clock-for-tsf.patch
+      ./ath10k/0002-wifi-ath10k-add-kunit-tests-for-ptp-clock.patch
+    ]; }
+    { name = "ath11k-kunit"; patches = [
+      ./ath11k/0001-wifi-ath11k-add-ptp-hardware-clock-for-tsf.patch
+      ./ath11k/0002-wifi-ath11k-add-kunit-tests-for-ptp-clock.patch
+    ]; }
+  ];
+
+  kunitPatchesNetNext = [
+    { name = "mt76-kunit";  patches = [
+      ./net-next/mt76/0001-wifi-mt76-add-ptp-hardware-clock-for-tsf.patch
+      ./net-next/mt76/0002-wifi-mt76-add-kunit-tests-for-ptp-clock.patch
+    ]; }
+    { name = "ath10k-kunit"; patches = [
+      ./net-next/ath10k/0001-wifi-ath10k-add-ptp-hardware-clock-for-tsf.patch
+      ./net-next/ath10k/0002-wifi-ath10k-add-kunit-tests-for-ptp-clock.patch
+    ]; }
+    { name = "ath11k-kunit"; patches = [
+      ./net-next/ath11k/0001-wifi-ath11k-add-ptp-hardware-clock-for-tsf.patch
+      ./net-next/ath11k/0002-wifi-ath11k-add-kunit-tests-for-ptp-clock.patch
+    ]; }
+  ];
 in
 {
-  inherit pinnedKernelSource kernelSources driverPatches driverPatchesNetNext;
+  inherit pinnedKernelSource kernelSources driverPatches driverPatchesNetNext
+          kunitPatches kunitPatchesNetNext;
 
   # Backward compatibility alias.
   kernelSource = pinnedKernelSource;
@@ -119,6 +152,29 @@ in
         inherit (p) name patch;
       }) driverPatches;
     };
+
+  # ── Sequential check: verify a patch series applies cleanly ──────────
+  #
+  # For patches that depend on prior patches (e.g., KUnit 0002 needs 0001).
+  mkSequentialPatchCheck = { name, patches, kernelSrc ? pinnedKernelSource, srcLabel ? "v6.12" }:
+    pkgs.runCommand "patch-check-${name}-${srcLabel}" {
+      nativeBuildInputs = with pkgs; [ gnupatch gnutar xz ];
+    } ''
+      if [ -d "${kernelSrc}" ]; then
+        cp -r "${kernelSrc}" src
+      else
+        mkdir src && tar xf "${kernelSrc}" -C src --strip-components=1
+      fi
+      chmod -R u+w src
+      cd src
+      ${lib.concatMapStringsSep "\n" (p: ''
+        echo "Applying: ${p}"
+        patch -p1 < ${p}
+      '') patches}
+      echo "PASS: ${name} applies cleanly against ${srcLabel}"
+      mkdir -p $out
+      echo "${name}" > $out/name
+    '';
 
   # ── Combined check: all patches apply to the same tree ──────────────
   #

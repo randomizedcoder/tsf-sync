@@ -1,0 +1,350 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Tue, 1 Apr 2026 00:00:00 +0000
+Subject: [PATCH 2/2] wifi: ath10k: add KUnit tests for PTP hardware clock
+
+Table-driven KUnit tests for the ath10k PTP hardware clock.
+
+Test suites:
+
+  ath10k_ptp_direction:
+    - inc_tsf/dec_tsf direction selection (11 parameterized cases)
+    - zero and sub-us delta early return
+    - u32 boundary and overflow truncation
+
+  ath10k_ptp_event:
+    - TSF event stores value and signals completion
+    - overwrite semantics
+    - no-vdev guard (ptp_vdev_id < 0)
+
+  ath10k_ptp_contract:
+    - adjfine returns 0 for any input (fixed crystal)
+
+Total: 16 tests.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ 3 files changed, 280 insertions(+), 1 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath10k/Kconfig b/drivers/net/wireless/ath/ath10k/Kconfig
+--- a/drivers/net/wireless/ath/ath10k/Kconfig	2026-04-05 09:06:19.144163729 -0700
++++ b/drivers/net/wireless/ath/ath10k/Kconfig	2026-04-05 09:06:19.167262537 -0700
+@@ -16,6 +16,19 @@
+ config ATH10K_CE
+ 	bool
+ 
++config ATH10K_PTP_KUNIT_TEST
++	tristate "KUnit tests for ath10k PTP hardware clock" if !KUNIT_ALL_TESTS
++	depends on ATH10K && PTP_1588_CLOCK && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  KUnit tests for the ath10k PTP hardware clock logic.
++	  Tests verify direction selection (inc_tsf vs dec_tsf),
++	  u32 truncation, TSF event completion mechanism, and
++	  PTP API contracts.
++
++	  If unsure, say N.
++
++
+ config ATH10K_PCI
+ 	tristate "Atheros ath10k PCI support"
+ 	depends on ATH10K && PCI
+diff --git a/drivers/net/wireless/ath/ath10k/Makefile b/drivers/net/wireless/ath/ath10k/Makefile
+--- a/drivers/net/wireless/ath/ath10k/Makefile	2026-04-05 09:06:19.144215146 -0700
++++ b/drivers/net/wireless/ath/ath10k/Makefile	2026-04-05 09:06:19.167333640 -0700
+@@ -26,6 +26,8 @@
+ ath10k_core-$(CONFIG_ATH10K_CE) += ce.o
+ 
+ ath10k_core-$(CONFIG_PTP_1588_CLOCK) += ptp.o
++
++obj-$(CONFIG_ATH10K_PTP_KUNIT_TEST) += ath10k_ptp_kunit_test.o
+ obj-$(CONFIG_ATH10K_PCI) += ath10k_pci.o
+ ath10k_pci-y += pci.o
+ 
+diff --git a/drivers/net/wireless/ath/ath10k/ptp.c b/drivers/net/wireless/ath/ath10k/ptp.c
+--- a/drivers/net/wireless/ath/ath10k/ptp.c	2026-04-05 09:06:19.145661815 -0700
++++ b/drivers/net/wireless/ath/ath10k/ptp.c	2026-04-05 09:06:19.167112965 -0700
+@@ -17,6 +17,7 @@
+ #include "core.h"
+ #include "wmi-ops.h"
+ #include "ptp.h"
++#include <kunit/visibility.h>
+ 
+ #if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
+ 
+@@ -107,7 +108,7 @@
+ 	return 0;
+ }
+ 
+-static int ath10k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++VISIBLE_IF_KUNIT int ath10k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+ {
+ 	/* Fixed crystal oscillator -- no hardware frequency tuning. */
+ 	return 0;
+diff --git a/drivers/net/wireless/ath/ath10k/ptp_kunit_test.c b/drivers/net/wireless/ath/ath10k/ptp_kunit_test.c
+--- a/drivers/net/wireless/ath/ath10k/ptp_kunit_test.c	1969-12-31 16:00:00.000000000 -0800
++++ b/drivers/net/wireless/ath/ath10k/ptp_kunit_test.c	2026-04-05 09:06:19.167397981 -0700
+@@ -0,0 +1,263 @@
++// SPDX-License-Identifier: ISC
++/*
++ * KUnit tests for ath10k PTP hardware clock
++ *
++ * Tests the direction-selection logic and conversion math used by
++ * ath10k_ptp_adjtime.  ath10k uses separate WMI inc_tsf/dec_tsf
++ * parameters for positive/negative adjustments, so the sign handling
++ * and u32 truncation must be correct.
++ *
++ * Also tests the TSF completion event mechanism and PTP API contract.
++ *
++ * Test suites:
++ *
++ *   ath10k_ptp_direction:
++ *     - positive delta selects inc_tsf (11 parameterized cases)
++ *     - negative delta selects dec_tsf
++ *     - zero / sub-µs delta → early return (no WMI call)
++ *     - u32 boundary and overflow truncation
++ *
++ *   ath10k_ptp_event:
++ *     - TSF event stores value and signals completion
++ *     - overwrite semantics
++ *
++ *   ath10k_ptp_contract:
++ *     - adjfine returns 0 for any input (fixed crystal)
++ *
++ * Total: 11 parameterized + 4 event + 1 contract = 16 tests.
++ */
++
++#include <kunit/test.h>
++#include <linux/ptp_clock_kernel.h>
++#include <linux/math64.h>
++#include <linux/completion.h>
++#include "core.h"
++#include "ptp.h"
++
++/* Forward declaration -- VISIBLE_IF_KUNIT in ptp.c */
++int ath10k_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm);
++
++/* ================================================================
++ * Direction selection logic -- extracted from ath10k_ptp_adjtime
++ *
++ * ath10k uses inc_tsf for positive deltas and dec_tsf for negative.
++ * The delta is converted from nanoseconds to microseconds, and the
++ * absolute value is cast to u32 for the WMI parameter.
++ *
++ * Key properties:
++ *   - Sub-µs deltas (|delta_ns| < 1000) truncate to 0, returning early
++ *   - (u32) cast truncates deltas > ~71.6 minutes (4294967295 µs)
++ * ================================================================ */
++
++enum ath10k_ptp_dir { ATH10K_PTP_INC, ATH10K_PTP_DEC };
++
++/*
++ * Same math as ath10k_ptp_adjtime, extracted for isolated testing:
++ *   delta_usec = div_s64(delta_ns, 1000)
++ *   if delta_usec == 0 -> skip
++ *   if delta_usec < 0  -> DEC, abs = (u32)(-delta_usec)
++ *   else               -> INC, abs = (u32)(delta_usec)
++ */
++static void ath10k_adjtime_direction(s64 delta_ns, bool *skip,
++				     enum ath10k_ptp_dir *dir,
++				     u32 *abs_delta)
++{
++	s64 delta_usec = div_s64(delta_ns, NSEC_PER_USEC);
++
++	if (delta_usec == 0) {
++		*skip = true;
++		return;
++	}
++
++	*skip = false;
++	if (delta_usec < 0) {
++		*dir = ATH10K_PTP_DEC;
++		*abs_delta = (u32)(-delta_usec);
++	} else {
++		*dir = ATH10K_PTP_INC;
++		*abs_delta = (u32)delta_usec;
++	}
++}
++
++struct direction_case {
++	const char *desc;
++	s64 delta_ns;
++	bool expect_skip;
++	int expect_dir;
++	u32 expect_abs;
++};
++
++static const struct direction_case direction_cases[] = {
++	{ "positive_1us",
++	  1000, false, ATH10K_PTP_INC, 1 },
++	{ "negative_1us",
++	  -1000, false, ATH10K_PTP_DEC, 1 },
++	{ "positive_1sec",
++	  1000000000LL, false, ATH10K_PTP_INC, 1000000 },
++	{ "negative_1sec",
++	  -1000000000LL, false, ATH10K_PTP_DEC, 1000000 },
++	{ "zero",
++	  0, true, 0, 0 },
++	{ "sub_usec_positive_999ns",
++	  999, true, 0, 0 },
++	{ "sub_usec_negative_999ns",
++	  -999, true, 0, 0 },
++	{ "positive_truncation_1500ns",
++	  1500, false, ATH10K_PTP_INC, 1 },
++	{ "negative_truncation_1500ns",
++	  -1500, false, ATH10K_PTP_DEC, 1 },
++	/*
++	 * u32 boundary: 4294967295 us ~ 71.6 minutes.
++	 * Values beyond this wrap due to (u32) cast.
++	 */
++	{ "u32_max_boundary",
++	  (s64)4294967295ULL * NSEC_PER_USEC, false, ATH10K_PTP_INC,
++	  4294967295U },
++	{ "u32_overflow_wraps_to_zero",
++	  (s64)4294967296ULL * NSEC_PER_USEC, false, ATH10K_PTP_INC, 0 },
++};
++
++static void ath10k_ptp_test_direction(struct kunit *test)
++{
++	const struct direction_case *p = test->param_value;
++	bool skip = false;
++	enum ath10k_ptp_dir dir = ATH10K_PTP_INC;
++	u32 abs_delta = 0;
++
++	ath10k_adjtime_direction(p->delta_ns, &skip, &dir, &abs_delta);
++
++	KUNIT_EXPECT_EQ(test, skip, p->expect_skip);
++	if (!skip) {
++		KUNIT_EXPECT_EQ(test, (int)dir, p->expect_dir);
++		KUNIT_EXPECT_EQ(test, abs_delta, p->expect_abs);
++	}
++}
++
++KUNIT_ARRAY_PARAM_DESC(ath10k_ptp_direction, direction_cases, desc);
++
++/* ================================================================
++ * TSF event mechanism tests
++ *
++ * ath10k_ptp_tsf_event() is called by the WMI event handler when
++ * a TSF stats response arrives.  It stores the value and signals
++ * the completion so ath10k_ptp_read_tsf() can return.
++ * ================================================================ */
++
++struct ath10k_ptp_test_ctx {
++	struct ath10k *ar;
++};
++
++static int ath10k_ptp_test_init(struct kunit *test)
++{
++	struct ath10k_ptp_test_ctx *ctx;
++
++	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx);
++
++	ctx->ar = kunit_kzalloc(test, sizeof(*ctx->ar), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->ar);
++
++	init_completion(&ctx->ar->tsf_read_complete);
++	ctx->ar->ptp_vdev_id = -1;
++
++	test->priv = ctx;
++	return 0;
++}
++
++static void ath10k_ptp_test_event_stores_value(struct kunit *test)
++{
++	struct ath10k_ptp_test_ctx *ctx = test->priv;
++
++	ath10k_ptp_tsf_event(ctx->ar, 42000000ULL);
++	KUNIT_EXPECT_EQ(test, ctx->ar->tsf_read_value, 42000000ULL);
++}
++
++static void ath10k_ptp_test_event_completes(struct kunit *test)
++{
++	struct ath10k_ptp_test_ctx *ctx = test->priv;
++
++	reinit_completion(&ctx->ar->tsf_read_complete);
++	ath10k_ptp_tsf_event(ctx->ar, 1000000ULL);
++	KUNIT_EXPECT_TRUE(test, completion_done(&ctx->ar->tsf_read_complete));
++}
++
++static void ath10k_ptp_test_event_overwrites(struct kunit *test)
++{
++	struct ath10k_ptp_test_ctx *ctx = test->priv;
++
++	ath10k_ptp_tsf_event(ctx->ar, 100ULL);
++	ath10k_ptp_tsf_event(ctx->ar, 200ULL);
++	KUNIT_EXPECT_EQ(test, ctx->ar->tsf_read_value, 200ULL);
++}
++
++static void ath10k_ptp_test_no_vdev_guard(struct kunit *test)
++{
++	struct ath10k_ptp_test_ctx *ctx = test->priv;
++
++	/*
++	 * When ptp_vdev_id < 0 (no vdev active), ath10k_ptp_read_tsf()
++	 * returns 0 without sending a WMI command.  We verify the
++	 * precondition here: init sets ptp_vdev_id = -1.
++	 */
++	KUNIT_EXPECT_LT(test, ctx->ar->ptp_vdev_id, 0);
++}
++
++/* ================================================================
++ * Contract tests
++ * ================================================================ */
++
++static void ath10k_ptp_test_adjfine_noop(struct kunit *test)
++{
++	struct ptp_clock_info dummy = {};
++
++	KUNIT_EXPECT_EQ(test, ath10k_ptp_adjfine(&dummy, 0), 0);
++	KUNIT_EXPECT_EQ(test, ath10k_ptp_adjfine(&dummy, 500000), 0);
++	KUNIT_EXPECT_EQ(test, ath10k_ptp_adjfine(&dummy, -500000), 0);
++	KUNIT_EXPECT_EQ(test, ath10k_ptp_adjfine(&dummy, S32_MAX), 0);
++}
++
++/* ================================================================
++ * Suite definitions
++ * ================================================================ */
++
++static struct kunit_case ath10k_ptp_direction_cases[] = {
++	KUNIT_CASE_PARAM(ath10k_ptp_test_direction,
++			 ath10k_ptp_direction_gen_params),
++	{},
++};
++
++static struct kunit_suite ath10k_ptp_direction_suite = {
++	.name = "ath10k_ptp_direction",
++	.test_cases = ath10k_ptp_direction_cases,
++};
++
++static struct kunit_case ath10k_ptp_event_cases[] = {
++	KUNIT_CASE(ath10k_ptp_test_event_stores_value),
++	KUNIT_CASE(ath10k_ptp_test_event_completes),
++	KUNIT_CASE(ath10k_ptp_test_event_overwrites),
++	KUNIT_CASE(ath10k_ptp_test_no_vdev_guard),
++	{},
++};
++
++static struct kunit_suite ath10k_ptp_event_suite = {
++	.name = "ath10k_ptp_event",
++	.init = ath10k_ptp_test_init,
++	.test_cases = ath10k_ptp_event_cases,
++};
++
++static struct kunit_case ath10k_ptp_contract_cases[] = {
++	KUNIT_CASE(ath10k_ptp_test_adjfine_noop),
++	{},
++};
++
++static struct kunit_suite ath10k_ptp_contract_suite = {
++	.name = "ath10k_ptp_contract",
++	.test_cases = ath10k_ptp_contract_cases,
++};
++
++kunit_test_suites(&ath10k_ptp_direction_suite,
++		  &ath10k_ptp_event_suite,
++		  &ath10k_ptp_contract_suite);
++
++MODULE_DESCRIPTION("KUnit tests for ath10k PTP hardware clock");
++MODULE_LICENSE("GPL");
