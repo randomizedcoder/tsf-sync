@@ -9,7 +9,7 @@ Comprehensive survey of TSF and PTP support across all mainline Linux WiFi drive
 | Driver | Hardware | `get_tsf` | `set_tsf` | `offset_tsf` | PTP (native) | tsf-ptp support | Notes |
 |--------|----------|:---------:|:---------:|:------------:|:------------:|:---------------:|-------|
 | **iwlwifi (mvm)** | Intel AX200/201/210/211, BE200, 7260, 8265 | Yes | No | No | **Yes** | Not needed | Already exposes PTP clock via GP2. `getcrosststamp` for precise correlation. No `set_tsf` — firmware doesn't support direct TSF writes. |
-| **mt76 (mt7921/mt7922)** | MediaTek MT7921, MT7922, MT7925 (WiFi 6E) | Yes | Yes | No | No | **Yes** | TSF via MCU firmware commands. Our current hardware. |
+| **mt76 (mt7921/mt7922)** | MediaTek MT7921, MT7922, MT7925 (WiFi 6E) | Yes | Yes | No | No | **Yes** | Register-based TSF (`MT_LPON_UTTR0/1`, same layout as mt7915) via shared `mt792x_get_tsf`/`mt792x_set_tsf`. Our current hardware. |
 | **mt76 (mt7915)** | MediaTek MT7915, MT7916, MT7986 | Yes | Yes | No | No | **Yes** | Register-based TSF (`MT_LPON_UTTR0/1`). |
 | **mt76 (mt7996)** | MediaTek MT7996 (WiFi 7) | Yes | Yes | No | No | **Yes** | Register-based TSF. Latest MediaTek. |
 | **mt76 (mt7615)** | MediaTek MT7615, MT7622 | Yes | Yes | No | No | **Yes** | Register-based TSF. |

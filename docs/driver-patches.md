@@ -157,7 +157,7 @@ drivers/net/wireless/ath/ath11k/ptp.h    |  21 +++  (new)
 
 ## mt76 — MediaTek MT7915/7921/7996
 
-Common PTP implementation at the `mt76_dev` level with per-chipset TSF access abstracted via `mt76_ptp_ops` callbacks. This handles the diversity of MediaTek's lineup: mt7915/mt7996 use direct MMIO registers (`MT_LPON_UTTR0/UTTR1`), while mt7921/mt7925 go through MCU firmware commands. The only driver that implements `getcrosststamp`, providing system-to-device clock correlation.
+Common PTP implementation at the `mt76_dev` level with per-chipset TSF access abstracted via `mt76_ptp_ops` callbacks. This handles the diversity of MediaTek's lineup: mt7915/mt7996 and mt7921/mt7922/mt7925 all use direct MMIO to `MT_LPON_UTTR0/UTTR1` (paired with an `MT_LPON_TCR` software-read/write handshake) — the `mt792x` family reuses the same TSF-register layout as mt7915, not MCU commands. The only driver that implements `getcrosststamp`, providing system-to-device clock correlation.
 
 **PTP operations:**
 
@@ -181,7 +181,7 @@ Common PTP implementation at the `mt76_dev` level with per-chipset TSF access ab
 |---------|--------|-----------|
 | MT7915/7916/7986 | Direct register | MT_LPON_UTTR0/UTTR1 |
 | MT7996 | Direct register | Register-based TSF |
-| MT7921/7922/7925 | MCU firmware | MCU commands |
+| MT7921/7922/7925 | Direct register | MT_LPON_UTTR0/UTTR1 (shared `mt792x_get_tsf`/`mt792x_set_tsf`) |
 
 **Files changed (4 files, +164):**
 

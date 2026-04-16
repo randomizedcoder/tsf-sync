@@ -8,11 +8,14 @@ exposing the 802.11 TSF timer to the Linux PTP subsystem. This enables
 phc2sys to synchronize TSF counters across co-located radios.
 
 PTP clock operations access TSF via the common mt76 register I/O layer.
-Each chipset stores TSF in different registers, so per-chipset callbacks
-are used:
+All currently-supported chipsets use direct MMIO to MT_LPON_UTTR0/UTTR1
+(paired with an MT_LPON_TCR software-read/write handshake); per-chipset
+callbacks are kept so future chipsets with a different TSF location can
+supply their own tsf_read/tsf_write without touching the generic path:
   - mt7915/mt7916/mt7986: MT_LPON_UTTR0/UTTR1 (direct register)
-  - mt7996: register-based TSF
-  - mt7921/mt7922/mt7925: MCU firmware commands
+  - mt7996: MT_LPON_UTTR0/UTTR1 (direct register)
+  - mt7921/mt7922/mt7925: MT_LPON_UTTR0/UTTR1 (direct register, shared
+    via mt792x_get_tsf/mt792x_set_tsf)
 
 The PTP clock is registered at the common mt76_dev level and uses
 per-chipset tsf_read/tsf_write callbacks for hardware abstraction.
@@ -99,7 +102,7 @@ diff --git a/drivers/net/wireless/mediatek/mt76/ptp.c b/drivers/net/wireless/med
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/wireless/mediatek/mt76/ptp.c
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,142 @@
 +// SPDX-License-Identifier: ISC
 +/*
 + * mt76 PTP hardware clock -- expose TSF as /dev/ptpN
@@ -108,9 +111,11 @@ new file mode 100644
 + * access is abstracted via mt76_ptp_ops callbacks, set during chipset
 + * init (mt7915_register_device, mt7921_register_device, etc.).
 + *
-+ * For register-based chipsets (mt7915, mt7996), TSF read/write is a
-+ * direct MMIO access. For firmware-based chipsets (mt7921), TSF access
-+ * goes through MCU commands.
++ * All currently-supported chipsets (mt7915/mt7916/mt7986, mt7996, and
++ * the mt792x family mt7921/mt7922/mt7925) read/write TSF via direct
++ * MMIO to MT_LPON_UTTR0/UTTR1, so the callbacks are thin wrappers over
++ * mt76_rr/mt76_wr. The callback indirection is retained so future
++ * chipsets that place TSF elsewhere can supply their own ops.
 + *
 + * TSF is in microseconds (802.11); PTP is in nanoseconds.
 + */

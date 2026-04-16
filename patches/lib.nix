@@ -61,13 +61,18 @@ let
 
   # Patches rebased for net-next (submission target).
   # Start as copies of v6.12 patches; rebase each against the net-next source.
+  #
+  # mt76-ptp-mt792x depends on mt76-ptp (0001 adds the infrastructure;
+  # 0004 wires mt792x chipset ptp_ops). Order matters in patch-check-all-net-next
+  # and in consumers that apply the list sequentially.
   driverPatchesNetNext = [
-    { name = "ath9k-ptp";  patch = ./net-next/ath9k/0001-wifi-ath9k-add-ptp-hardware-clock-for-tsf.patch; }
-    { name = "mt76-ptp";   patch = ./net-next/mt76/0001-wifi-mt76-add-ptp-hardware-clock-for-tsf.patch; }
-    { name = "rtw88-ptp";  patch = ./net-next/rtw88/0001-wifi-rtw88-add-ptp-hardware-clock-for-tsf.patch; }
-    { name = "rtw89-ptp";  patch = ./net-next/rtw89/0001-wifi-rtw89-add-ptp-hardware-clock-for-tsf.patch; }
-    { name = "ath10k-ptp"; patch = ./net-next/ath10k/0001-wifi-ath10k-add-ptp-hardware-clock-for-tsf.patch; }
-    { name = "ath11k-ptp"; patch = ./net-next/ath11k/0001-wifi-ath11k-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "ath9k-ptp";         patch = ./net-next/ath9k/0001-wifi-ath9k-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "mt76-ptp";          patch = ./net-next/mt76/0001-wifi-mt76-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "mt76-ptp-mt792x";   patch = ./net-next/mt76/0004-wifi-mt76-register-ptp-ops-for-mt792x.patch; }
+    { name = "rtw88-ptp";         patch = ./net-next/rtw88/0001-wifi-rtw88-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "rtw89-ptp";         patch = ./net-next/rtw89/0001-wifi-rtw89-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "ath10k-ptp";        patch = ./net-next/ath10k/0001-wifi-ath10k-add-ptp-hardware-clock-for-tsf.patch; }
+    { name = "ath11k-ptp";        patch = ./net-next/ath11k/0001-wifi-ath11k-add-ptp-hardware-clock-for-tsf.patch; }
   ];
 
   # KUnit test patches (must be applied after corresponding 0001 patches).

@@ -47,9 +47,9 @@ The driver's central challenge is hardware diversity. A single `mt76_dev` base s
 |---|---|---|---|
 | MT7915/7916/7986 | Direct MMIO registers (`MT_LPON_UTTR0/UTTR1`) | PCIe | Embedded MCU |
 | MT7996 | Direct MMIO registers | PCIe | Embedded MCU |
-| MT7921/7922/7925 | MCU firmware commands | PCIe/USB | Host-loaded firmware |
+| MT7921/7922/7925 | Direct MMIO registers (`MT_LPON_UTTR0/UTTR1`, shared with mt7915 via `mt792x_get_tsf`/`mt792x_set_tsf`) | PCIe/USB | Host-loaded firmware |
 
-Register-based chipsets have 1-10 us TSF latency; firmware-based chipsets have 10-500 us.
+All mt76 chipsets surveyed use register-based TSF access with 1-10 us latency; the host-loaded vs embedded MCU split is orthogonal to the TSF path.
 
 ---
 

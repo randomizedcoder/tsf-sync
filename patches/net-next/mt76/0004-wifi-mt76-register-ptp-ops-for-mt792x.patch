@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Wed, 15 Apr 2026 00:00:00 +0000
+Subject: [PATCH] wifi: mt76: register mt76_ptp_ops for the mt792x family
+
+The previous patch added generic PTP clock infrastructure at the
+mt76_dev level, gated on each chipset driver supplying an
+mt76_ptp_ops with .tsf_read and .tsf_write. Without a registered
+ops table, mt76_ptp_init() skips registration and no /dev/ptpN
+device is created.
+
+mt7921, mt7922 and mt7925 all share the mt792x core and already
+reach TSF through direct MMIO to MT_LPON_UTTR0/UTTR1 (paired with
+an MT_LPON_TCR software-read/write handshake), identical to
+mt7915 -- see mt792x_get_tsf() / mt792x_set_tsf() in mt792x_core.c.
+The only wrinkle is that the existing helpers derive the TCR bank
+index from a vif's omac_idx; PTP has no vif context, so the PTP
+callbacks hardcode HW_BSSID_0. This matches what mt792x_get_tsf()
+already does when omac_idx exceeds HW_BSSID_MAX.
+
+The new PTP callbacks deliberately do not take dev->mutex --
+mt76_ptp_gettime64 / mt76_ptp_settime64 / mt76_ptp_adjtime in
+ptp.c already serialise on dev->mutex before invoking ops, so
+re-acquiring here would deadlock.
+
+After this patch, mt7921 and mt7925 each register a single PTP
+clock per mt76_dev at probe time, exposing TSF as /dev/ptpN.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ drivers/net/wireless/mediatek/mt76/mt792x.h      |  4 ++
+ drivers/net/wireless/mediatek/mt76/mt792x_core.c | 45 +++++++++++++++++++
+ drivers/net/wireless/mediatek/mt76/mt7921/init.c |  4 ++
+ drivers/net/wireless/mediatek/mt76/mt7925/init.c |  4 ++
+ 4 files changed, 57 insertions(+)
+
+diff --git a/drivers/net/wireless/mediatek/mt76/mt792x.h b/drivers/net/wireless/mediatek/mt76/mt792x.h
+--- a/drivers/net/wireless/mediatek/mt76/mt792x.h
++++ b/drivers/net/wireless/mediatek/mt76/mt792x.h
+@@ -389,6 +389,10 @@ int mt792x_get_stats(struct ieee80211_hw *hw,
+ u64 mt792x_get_tsf(struct ieee80211_hw *hw, struct ieee80211_vif *vif);
+ void mt792x_set_tsf(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		    u64 timestamp);
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++/* Shared PTP TSF callbacks for the mt792x family (MT7921/7922/7925). */
++extern const struct mt76_ptp_ops mt792x_ptp_ops;
++#endif
+ void mt792x_tx_worker(struct mt76_worker *w);
+ void mt792x_roc_timer(struct timer_list *timer);
+ void mt792x_csa_timer(struct timer_list *timer);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt792x_core.c b/drivers/net/wireless/mediatek/mt76/mt792x_core.c
+--- a/drivers/net/wireless/mediatek/mt76/mt792x_core.c
++++ b/drivers/net/wireless/mediatek/mt76/mt792x_core.c
+@@ -981,6 +981,51 @@ void mt792x_config_mac_addr_list(struct mt792x_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(mt792x_config_mac_addr_list);
+ 
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++/*
++ * mt792x_ptp_tsf_read - raw MMIO TSF read for the mt76 PTP layer.
++ *
++ * Called from mt76_ptp_gettime64 / adjtime, which already serialise on
++ * dev->mutex; this callback must not re-acquire the device mutex or it
++ * will deadlock against the generic PTP ops.
++ *
++ * mt792x_get_tsf() picks the TCR bank from the vif's omac_idx; PTP has
++ * no vif context, so hardcode HW_BSSID_0 (the same bank mt792x_get_tsf
++ * falls back to when omac_idx exceeds HW_BSSID_MAX).
++ */
++static u64 mt792x_ptp_tsf_read(struct mt76_dev *mdev)
++{
++	union {
++		u64 t64;
++		u32 t32[2];
++	} tsf;
++
++	mt76_set(mdev, MT_LPON_TCR(0, HW_BSSID_0), MT_LPON_TCR_SW_MODE);
++	tsf.t32[0] = mt76_rr(mdev, MT_LPON_UTTR0(0));
++	tsf.t32[1] = mt76_rr(mdev, MT_LPON_UTTR1(0));
++
++	return tsf.t64;
++}
++
++static void mt792x_ptp_tsf_write(struct mt76_dev *mdev, u64 timestamp)
++{
++	union {
++		u64 t64;
++		u32 t32[2];
++	} tsf = { .t64 = timestamp, };
++
++	mt76_wr(mdev, MT_LPON_UTTR0(0), tsf.t32[0]);
++	mt76_wr(mdev, MT_LPON_UTTR1(0), tsf.t32[1]);
++	mt76_set(mdev, MT_LPON_TCR(0, HW_BSSID_0), MT_LPON_TCR_SW_WRITE);
++}
++
++const struct mt76_ptp_ops mt792x_ptp_ops = {
++	.tsf_read = mt792x_ptp_tsf_read,
++	.tsf_write = mt792x_ptp_tsf_write,
++};
++EXPORT_SYMBOL_GPL(mt792x_ptp_ops);
++#endif /* CONFIG_PTP_1588_CLOCK */
++
+ MODULE_DESCRIPTION("MediaTek MT792x core driver");
+ MODULE_LICENSE("Dual BSD/GPL");
+ MODULE_AUTHOR("Lorenzo Bianconi <lorenzo@kernel.org>");
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/init.c b/drivers/net/wireless/mediatek/mt76/mt7921/init.c
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/init.c
+@@ -238,6 +238,10 @@
+ 	mt7921_set_stream_he_caps(&dev->phy);
+ 	mt792x_config_mac_addr_list(dev);
+ 
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++	dev->mt76.ptp_ops = &mt792x_ptp_ops;
++#endif
++
+ 	ret = mt76_register_device(&dev->mt76, true, mt76_rates,
+ 				   ARRAY_SIZE(mt76_rates));
+ 	if (ret) {
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/init.c b/drivers/net/wireless/mediatek/mt76/mt7925/init.c
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/init.c
+@@ -161,6 +161,10 @@
+ 		return;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++	dev->mt76.ptp_ops = &mt792x_ptp_ops;
++#endif
++
+ 	ret = mt76_register_device(&dev->mt76, true, mt76_rates,
+ 				   ARRAY_SIZE(mt76_rates));
+ 	if (ret) {
