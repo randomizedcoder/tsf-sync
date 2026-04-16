@@ -25,10 +25,10 @@ TSF is in microseconds (802.11); PTP is in nanoseconds.
 Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
 ---
  drivers/net/wireless/mediatek/mt76/Makefile   |   1 +
- drivers/net/wireless/mediatek/mt76/mt76.h     |  17 +++
+ drivers/net/wireless/mediatek/mt76/mt76.h     |  27 ++++
  drivers/net/wireless/mediatek/mt76/mac80211.c |   4 +
  drivers/net/wireless/mediatek/mt76/ptp.c      | 142 ++++++++++++++++++++
- 4 files changed, 164 insertions(+)
+ 4 files changed, 174 insertions(+)
  create mode 100644 drivers/net/wireless/mediatek/mt76/ptp.c
 
 diff --git a/drivers/net/wireless/mediatek/mt76/Makefile b/drivers/net/wireless/mediatek/mt76/Makefile
@@ -79,6 +79,21 @@ diff --git a/drivers/net/wireless/mediatek/mt76/mt76.h b/drivers/net/wireless/me
  };
  
  /* per-phy stats.  */
+@@ -2108,4 +2125,14 @@ mt76_vif_link_phy(struct mt76_vif_link *mlink)
+ 	return ctx->phy;
+ }
+
++#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++void mt76_ptp_init(struct mt76_dev *dev);
++void mt76_ptp_remove(struct mt76_dev *dev);
++#else
++static inline void mt76_ptp_init(struct mt76_dev *dev)
++{
++}
++static inline void mt76_ptp_remove(struct mt76_dev *dev)
++{
++}
+ #endif
 diff --git a/drivers/net/wireless/mediatek/mt76/mac80211.c b/drivers/net/wireless/mediatek/mt76/mac80211.c
 --- a/drivers/net/wireless/mediatek/mt76/mac80211.c
 +++ b/drivers/net/wireless/mediatek/mt76/mac80211.c
