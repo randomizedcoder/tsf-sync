@@ -74,9 +74,9 @@ diff --git a/drivers/net/wireless/mediatek/mt76/mt792x_core.c b/drivers/net/wire
 +		u32 t32[2];
 +	} tsf;
 +
-+	mt76_set(mdev, MT_LPON_TCR(0, HW_BSSID_0), MT_LPON_TCR_SW_MODE);
-+	tsf.t32[0] = mt76_rr(mdev, MT_LPON_UTTR0(0));
-+	tsf.t32[1] = mt76_rr(mdev, MT_LPON_UTTR1(0));
++	__mt76_set(mdev, MT_LPON_TCR(0, HW_BSSID_0), MT_LPON_TCR_SW_MODE);
++	tsf.t32[0] = __mt76_rr(mdev, MT_LPON_UTTR0(0));
++	tsf.t32[1] = __mt76_rr(mdev, MT_LPON_UTTR1(0));
 +
 +	return tsf.t64;
 +}
@@ -88,9 +88,9 @@ diff --git a/drivers/net/wireless/mediatek/mt76/mt792x_core.c b/drivers/net/wire
 +		u32 t32[2];
 +	} tsf = { .t64 = timestamp, };
 +
-+	mt76_wr(mdev, MT_LPON_UTTR0(0), tsf.t32[0]);
-+	mt76_wr(mdev, MT_LPON_UTTR1(0), tsf.t32[1]);
-+	mt76_set(mdev, MT_LPON_TCR(0, HW_BSSID_0), MT_LPON_TCR_SW_WRITE);
++	__mt76_wr(mdev, MT_LPON_UTTR0(0), tsf.t32[0]);
++	__mt76_wr(mdev, MT_LPON_UTTR1(0), tsf.t32[1]);
++	__mt76_set(mdev, MT_LPON_TCR(0, HW_BSSID_0), MT_LPON_TCR_SW_WRITE);
 +}
 +
 +const struct mt76_ptp_ops mt792x_ptp_ops = {
