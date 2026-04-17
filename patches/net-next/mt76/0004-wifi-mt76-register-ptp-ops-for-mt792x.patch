@@ -29,10 +29,10 @@ clock per mt76_dev at probe time, exposing TSF as /dev/ptpN.
 Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
 ---
  drivers/net/wireless/mediatek/mt76/mt792x.h      |  4 ++
- drivers/net/wireless/mediatek/mt76/mt792x_core.c | 45 +++++++++++++++++++
+ drivers/net/wireless/mediatek/mt76/mt792x_core.c | 55 ++++++++++++++++++++++++
  drivers/net/wireless/mediatek/mt76/mt7921/init.c |  4 ++
  drivers/net/wireless/mediatek/mt76/mt7925/init.c |  4 ++
- 4 files changed, 57 insertions(+)
+ 4 files changed, 72 insertions(+)
 
 diff --git a/drivers/net/wireless/mediatek/mt76/mt792x.h b/drivers/net/wireless/mediatek/mt76/mt792x.h
 --- a/drivers/net/wireless/mediatek/mt76/mt792x.h
@@ -51,7 +51,7 @@ diff --git a/drivers/net/wireless/mediatek/mt76/mt792x.h b/drivers/net/wireless/
 diff --git a/drivers/net/wireless/mediatek/mt76/mt792x_core.c b/drivers/net/wireless/mediatek/mt76/mt792x_core.c
 --- a/drivers/net/wireless/mediatek/mt76/mt792x_core.c
 +++ b/drivers/net/wireless/mediatek/mt76/mt792x_core.c
-@@ -981,6 +981,51 @@ void mt792x_config_mac_addr_list(struct mt792x_dev *dev)
+@@ -981,6 +981,66 @@ void mt792x_config_mac_addr_list(struct mt792x_dev *dev)
  }
  EXPORT_SYMBOL_GPL(mt792x_config_mac_addr_list);
  
@@ -63,34 +63,49 @@ diff --git a/drivers/net/wireless/mediatek/mt76/mt792x_core.c b/drivers/net/wire
 + * dev->mutex; this callback must not re-acquire the device mutex or it
 + * will deadlock against the generic PTP ops.
 + *
++ * The mt792x family uses runtime PM, so we must wake the device before
++ * touching registers. mt76_connac_pm_wake/pm_unref handle this; they
++ * expect the caller to already hold dev->mutex.
++ *
 + * mt792x_get_tsf() picks the TCR bank from the vif's omac_idx; PTP has
 + * no vif context, so hardcode HW_BSSID_0 (the same bank mt792x_get_tsf
 + * falls back to when omac_idx exceeds HW_BSSID_MAX).
 + */
 +static u64 mt792x_ptp_tsf_read(struct mt76_dev *mdev)
 +{
++	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
 +	union {
 +		u64 t64;
 +		u32 t32[2];
 +	} tsf;
 +
++	/* Wake device from power save -- mutex already held by ptp.c. */
++	mt76_connac_pm_wake(&mdev->phy, &dev->pm);
++
 +	__mt76_set(mdev, MT_LPON_TCR(0, HW_BSSID_0), MT_LPON_TCR_SW_MODE);
 +	tsf.t32[0] = __mt76_rr(mdev, MT_LPON_UTTR0(0));
 +	tsf.t32[1] = __mt76_rr(mdev, MT_LPON_UTTR1(0));
++
++	mt76_connac_pm_unref(&mdev->phy, &dev->pm);
 +
 +	return tsf.t64;
 +}
 +
 +static void mt792x_ptp_tsf_write(struct mt76_dev *mdev, u64 timestamp)
 +{
++	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
 +	union {
 +		u64 t64;
 +		u32 t32[2];
 +	} tsf = { .t64 = timestamp, };
 +
++	mt76_connac_pm_wake(&mdev->phy, &dev->pm);
++
 +	__mt76_wr(mdev, MT_LPON_UTTR0(0), tsf.t32[0]);
 +	__mt76_wr(mdev, MT_LPON_UTTR1(0), tsf.t32[1]);
 +	__mt76_set(mdev, MT_LPON_TCR(0, HW_BSSID_0), MT_LPON_TCR_SW_WRITE);
++
++	mt76_connac_pm_unref(&mdev->phy, &dev->pm);
 +}
 +
 +const struct mt76_ptp_ops mt792x_ptp_ops = {
