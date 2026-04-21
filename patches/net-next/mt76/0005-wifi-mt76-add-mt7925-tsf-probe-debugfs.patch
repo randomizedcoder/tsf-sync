@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+Date: Sun, 20 Apr 2026 00:00:00 +0000
+Subject: [PATCH] wifi: mt76: add mt7925 tsf_probe debugfs for PTP diagnosis
+
+mt7925 devices on our 4x MT7925 test rig return 0 for every PTP TSF
+read (/dev/ptpN gettime64), and direct MMIO to MT_LPON_UTTR0/UTTR1 via
+the mt76_debugfs_reg pair also returns 0 despite the preceding
+MT_LPON_TCR SW_MODE latch writeback succeeding (readback reports the
+expected bits). Before deciding whether to rework the mt792x PTP
+callbacks to use a non-MMIO path, we need one more data point: does
+mac80211 -> ops->get_tsf (mt792x_get_tsf) also return 0 when invoked
+under mt792x's own locking, against an active beaconing vif?
+
+Add a read-only debugfs file phy0/tsf_probe that iterates the device's
+active vifs and, for each, calls mt792x_get_tsf directly, then
+snapshots MT_LPON_TCR / UTTR0 / UTTR1. This is strictly diagnostic --
+no behaviour changes, no module params, no init-time cost.
+
+If tsf_probe reports get_tsf == 0 on every vif, the LPON TSF latch is
+not backed by hardware on mt7925 (independent of PTP / caller / PM
+state), and the mt792x PTP glue (patch 0004) cannot work on mt7925 via
+MMIO; the callback set should be reduced to return -EOPNOTSUPP on this
+chip, or the PTP clock should be skipped entirely for mt7925. If
+tsf_probe reports a nonzero value while raw MMIO continues to read 0,
+some context (locking, PM wake, vif state) differs between the two
+paths and we align the PTP callback to match.
+
+Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
+---
+ drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c | 57 +++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c b/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c
+--- a/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c
+@@ -285,6 +285,61 @@ static int mt7925_chip_reset(void *data, u64 val)
+ 
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_reset, NULL, mt7925_chip_reset, "%lld\n");
+ 
++/*
++ * TSF probe -- calls mt792x_get_tsf via the same path mac80211 ops use,
++ * for each active vif on the device. Diagnostic-only: confirms whether
++ * the LPON TSF latch (MT_LPON_UTTR0/UTTR1 latched via MT_LPON_TCR
++ * SW_MODE) produces nonzero output when invoked under mt792x's own
++ * locking. If get_tsf returns 0 on every vif -- matching what raw
++ * debugfs MMIO reads produce -- the LPON path is not backed by
++ * hardware on mt7925 regardless of caller.
++ */
++struct mt7925_tsf_probe_ctx {
++	struct seq_file *s;
++	struct mt792x_dev *dev;
++};
++
++static void mt7925_tsf_probe_iter(void *data, u8 *mac,
++				  struct ieee80211_vif *vif)
++{
++	struct mt7925_tsf_probe_ctx *ctx = data;
++	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
++	u8 omac_idx = mvif->bss_conf.mt76.omac_idx;
++	u16 n = omac_idx > HW_BSSID_MAX ? HW_BSSID_0 : omac_idx;
++	u64 tsf;
++	u32 tcr_before, tcr_after, uttr0, uttr1;
++
++	tcr_before = mt76_rr(ctx->dev, MT_LPON_TCR(0, n));
++
++	tsf = mt792x_get_tsf(ctx->dev->mt76.hw, vif);
++
++	tcr_after = mt76_rr(ctx->dev, MT_LPON_TCR(0, n));
++	uttr0 = mt76_rr(ctx->dev, MT_LPON_UTTR0(0));
++	uttr1 = mt76_rr(ctx->dev, MT_LPON_UTTR1(0));
++
++	seq_printf(ctx->s,
++		   "vif %pM type=%u omac_idx=%u n=%u\n"
++		   "  get_tsf        = 0x%016llx (%llu)\n"
++		   "  TCR before     = 0x%08x\n"
++		   "  TCR after      = 0x%08x\n"
++		   "  UTTR0 (post)   = 0x%08x\n"
++		   "  UTTR1 (post)   = 0x%08x\n",
++		   vif->addr, vif->type, omac_idx, n,
++		   tsf, tsf, tcr_before, tcr_after, uttr0, uttr1);
++}
++
++static int mt7925_tsf_probe_show(struct seq_file *s, void *data)
++{
++	struct mt792x_dev *dev = dev_get_drvdata(s->private);
++	struct mt7925_tsf_probe_ctx ctx = { .s = s, .dev = dev };
++
++	seq_puts(s, "# mt7925 TSF probe -- invokes mt792x_get_tsf per active vif\n");
++	ieee80211_iterate_active_interfaces(dev->mt76.hw,
++					    IEEE80211_IFACE_ITER_RESUME_ALL,
++					    mt7925_tsf_probe_iter, &ctx);
++	return 0;
++}
++
+ int mt7925_init_debugfs(struct mt792x_dev *dev)
+ {
+ 	struct dentry *dir;
+@@ -314,6 +369,8 @@ int mt7925_init_debugfs(struct mt792x_dev *dev)
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "runtime_pm_stats", dir,
+ 				    mt792x_pm_stats);
+ 	debugfs_create_file("deep-sleep", 0600, dir, dev, &fops_ds);
++	debugfs_create_devm_seqfile(dev->mt76.dev, "tsf_probe", dir,
++				    mt7925_tsf_probe_show);
+ 
+ 	return 0;
+ }
