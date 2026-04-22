@@ -6,6 +6,8 @@ While reviewing the kernel source, we discovered that Intel ships PTP hardware c
 
 **Current hardware:** 24 WiFi cards (Intel AX210 + MediaTek MT7925), scaling to 60-100+ per host, multiple hosts.
 
+> **Status note (2026-04-21):** On-rig testing has confirmed that the MT7925 cards in the current rig cannot be synchronised via the register-based TSF path used by mt7921/mt7922 — the LPON TSF mirror is not populated by firmware, and MediaTek has not shipped an MCU TSF query for this chip. The Intel AX210 leg of the rig is unaffected and continues to work through native `iwlwifi` PTP. The critical open question is whether `set_tsf` still works on mt7925 in isolation — we have only exercised the read path so far. Full write-up (code-path trace, FiWiTSF comparison, affine-mapping analysis, next experiments) in [docs/mt7925-tsf-findings.md](docs/mt7925-tsf-findings.md).
+
 ---
 
 ## Quick Start (NixOS)
@@ -319,9 +321,9 @@ We write ~500 lines of kernel C + ~2000 lines of Rust. We get single-host sync, 
 | Tier | Drivers | PTP path |
 |------|---------|----------|
 | **Tier 1: Native PTP** | iwlwifi (Intel AX200/210/211, BE200) | Already works with `ptp4l` |
-| **Tier 2: tsf-ptp module** | mt76, ath9k, ath10k, ath11k, ath12k, rtw88, rtw89, brcmsmac, b43, carl9170, wlcore, wcn36xx, p54, ath5k, iwlegacy | Our kernel module bridges `get_tsf`/`set_tsf` → PTP |
+| **Tier 2: tsf-ptp module** | mt76 (mt7915/7921/7922/7996), ath9k, ath10k, ath11k, ath12k, rtw88, rtw89, brcmsmac, b43, carl9170, wlcore, wcn36xx, p54, ath5k, iwlegacy | Our kernel module bridges `get_tsf`/`set_tsf` → PTP |
 | **Tier 3: Read-only** | rtl8xxxu, wil6210 | Can read TSF but not write |
-| **Unsupported** | brcmfmac, mwifiex, ath6kl, zd1211rw, lbtf | FullMAC or no TSF ops |
+| **Unsupported** | mt76 (mt7925), brcmfmac, mwifiex, ath6kl, zd1211rw, lbtf | mt7925: register-mirror TSF not populated by firmware, no MCU query exists. Others: FullMAC or no TSF ops. |
 
 Full details: [Driver Compatibility Survey](docs/driver-survey.md)
 
@@ -336,7 +338,8 @@ We maintain per-driver PTP patches ready for upstream kernel submission. These a
 | ath9k | AR9xxx | Register (AR_TSF_L32/U32) | get/set/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
 | ath10k | QCA988x, QCA6174 | WMI firmware | get/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
 | ath11k | QCA6390, WCN6855 | WMI firmware | adj only | v6.12 ✓, 6.18 ✗, 6.19 ✗ |
-| mt76 | MT7915/7921/7996 | Per-chipset callbacks | get/set/adj + crosststamp | v6.12 ✓, 6.18 ✓, 6.19 ✗ |
+| mt76 | MT7915, MT7921, MT7922, MT7996 | Per-chipset callbacks | get/set/adj + crosststamp | v6.12 ✓, 6.18 ✓, 6.19 ✗ |
+| mt76 (mt7925) | MT7925 | — | — | **Unsupportable** — LPON TSF mirror not backed by hardware on this chip; no MCU TSF command exists in the mt7925 firmware interface. Verified on-rig 2026-04-21 via the `tsf_probe` debugfs (patch 0005). See [mt7925 TSF findings](docs/status.md#mt7925-tsf-findings-2026-04-21). |
 | rtw88 | RTL8822BE/CE | Register (0x0560/0x0564) | get/set/adj | v6.12 ✓, 6.18 ✗, 6.19 ✗ |
 | rtw89 | RTL8852AE/BE | Register (R_AX_TSFTR_P0) | get/set/adj | v6.12 ✓, 6.18 ✓, 6.19 ✓ |
 
@@ -492,6 +495,7 @@ tsf-sync/
 | [Multi-Host Operations](docs/multi-host.md) | Cross-host PTP setup, network requirements | Placeholder — Phase 2 |
 | [Upstream Driver Patches](docs/driver-patches.md) | Per-driver PTP patches for 6 WiFi drivers, verification, submission | Complete |
 | [Rust mt76 Feasibility](docs/rust-mt76-ptp.md) | R4L feasibility study for Rust mt76 driver (all subsystems) | Complete |
+| [MT7925 TSF Investigation](docs/mt7925-tsf-findings.md) | Why `get_tsf` fails on mt7925, FiWiTSF comparison, affine-mapping analysis, `set_tsf` open question | Living document |
 
 ---
 
