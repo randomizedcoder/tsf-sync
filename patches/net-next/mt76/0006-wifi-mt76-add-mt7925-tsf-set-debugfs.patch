@@ -35,16 +35,16 @@ Intended test procedure (manual):
 
 Signed-off-by: tsf-sync contributors <tsf-sync@users.noreply.github.com>
 ---
- drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c | 46 +++++++++++++++++++++
- 1 file changed, 46 insertions(+)
+ drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c | 42 +++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
 
 diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c b/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c
 --- a/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c
 +++ b/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c
-@@ -340,6 +340,50 @@ static int mt7925_tsf_probe_show(struct seq_file *s, void *data)
+@@ -340,6 +340,41 @@ static int mt7925_tsf_probe_show(struct seq_file *s, void *data)
  	return 0;
  }
-
+ 
 +/*
 + * TSF set -- invokes mt792x_set_tsf on every active vif with the
 + * user-supplied u64 value. Bare-minimum diagnostic companion to
@@ -72,12 +72,6 @@ diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c b/drivers/net/w
 +	struct mt792x_dev *dev = data;
 +	struct mt7925_tsf_set_ctx ctx = { .dev = dev, .tsf = val };
 +
-+	/*
-+	 * mt792x_set_tsf takes dev->mutex internally (mt792x_mutex_acquire
-+	 * inside the op), so we must NOT hold it here. Iterate active vifs
-+	 * under rtnl via the standard mac80211 helper; each iteration
-+	 * enters and exits the mutex cleanly.
-+	 */
 +	ieee80211_iterate_active_interfaces(dev->mt76.hw,
 +					    IEEE80211_IFACE_ITER_RESUME_ALL,
 +					    mt7925_tsf_set_iter, &ctx);
@@ -89,11 +83,11 @@ diff --git a/drivers/net/wireless/mediatek/mt76/mt7925/debugfs.c b/drivers/net/w
  int mt7925_init_debugfs(struct mt792x_dev *dev)
  {
  	struct dentry *dir;
-@@ -371,6 +415,8 @@ int mt7925_init_debugfs(struct mt792x_dev *dev)
+@@ -371,6 +406,7 @@ int mt7925_init_debugfs(struct mt792x_dev *dev)
  	debugfs_create_file("deep-sleep", 0600, dir, dev, &fops_ds);
  	debugfs_create_devm_seqfile(dev->mt76.dev, "tsf_probe", dir,
  				    mt7925_tsf_probe_show);
 +	debugfs_create_file("tsf_set", 0200, dir, dev, &fops_tsf_set);
-
+ 
  	return 0;
  }
