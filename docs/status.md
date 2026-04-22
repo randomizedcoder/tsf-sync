@@ -1,6 +1,6 @@
 # Project Status
 
-> Last updated: 2026-04-01
+> Last updated: 2026-04-21
 
 ---
 
@@ -130,6 +130,36 @@ Not started. Depends on Phase 1 completion.
 - [ ] Engage with driver subsystem maintainers
 - [ ] Submit to linux-wireless@vger.kernel.org
 - [ ] Iterate on review feedback
+
+---
+
+## mt7925 TSF findings (2026-04-21)
+
+> **See the full investigation in [mt7925-tsf-findings.md](mt7925-tsf-findings.md)** — including the kernel code-path trace, the FiWiTSF comparison, the affine-mapping analysis, alternative sample sources, and the critical open question of whether `set_tsf` still works on this chip.
+
+The current test rig (`l2`) holds four MT7925 cards. When we wired the upstream PTP patch 0004 to register `mt76_ptp_ops` for the entire mt792x family (mt7921/mt7922/mt7925), `/dev/ptp0..3` appeared but every `gettime64` returned 0. Three theories were evaluated:
+
+| Theory | Claim | Verdict |
+|--------|-------|---------|
+| **A** | `MT_LPON_TCR` SW_MODE latch writes don't reach the hardware | **Ruled out** — TCR readback after the write is `0x01640007` on every card, so the write does land in the register. |
+| **B** | The LPON TSF mirror (`MT_LPON_UTTR0/UTTR1`) is not populated by mt7925 hardware/firmware | **Confirmed** — `UTTR0/UTTR1` read zero on all four cards, on every active AP vif, under both PTP and mac80211 code paths, with correct `omac_idx` and locking. |
+| **C** | Register offsets are wrong for mt7925 | **Ruled out** — offsets are identical to the in-tree `mt792x_get_tsf`, which works on mt7921/mt7922 silicon. |
+
+The diagnostic path stays in-tree as patch 0005 (`/sys/kernel/debug/ieee80211/phyN/mt76/tsf_probe`). It runs the canonical `ieee80211_ops->get_tsf` path plus raw TCR/UTTR readback for every active vif and prints the raw values — the failure mode is reproducible with `cat`.
+
+Patch 0004 was subsequently revised to register `mt76_ptp_ops` only for mt7921/mt7922 (see PR #8, merged 2026-04-21). The MediaTek MCU firmware exposes `TWT_AGRT_GET_TSF` only on mt7996/mt7915 — no equivalent MCU TSF query exists for mt7925, so we have no in-driver fallback path on this chip.
+
+Implication for the 24-card rig: the Intel AX210 half is unaffected and can still serve as a single-host grandmaster. The MT7925 half is currently **read-nor-write** from software, which is a strictly stronger limitation than the "Tier 2" assumption in the driver survey.
+
+## Alternative approaches for mt7925
+
+Summarised here; full analysis in [mt7925-tsf-findings.md](mt7925-tsf-findings.md):
+
+1. **Test `set_tsf` in isolation** *(critical next step)* — we have only exercised the read path. If writes reach on-air TSF, hardware coordination is still achievable with a different read source; if they don't, no approach works. Extend the `tsf_probe` debugfs with a write test driven by an external reference clock (the Intel AX210 in the same host) and observe on-air beacons.
+2. **RX-descriptor beacon timestamps as an alternate sample source** — bypasses the dead LPON mirror entirely. Combines naturally with FiWiTSF's affine-mapping layer.
+3. **FiWiTSF affine mapping** *(software prediction, no `set_tsf` needed)* — per-radio linear map `t_radio ≈ α·t_master + β`, refit from paired samples. Useful once we have any working sample source; insufficient on its own for on-air (EDCA) coordination.
+4. **Hardware mitigation** — pivot mt7925 slots to mt7921/mt7922, or keep mt7925 cards free-running with Intel AX210 as reference.
+5. **Firmware request to MediaTek** — in parallel; low effort, slow payoff.
 
 ---
 

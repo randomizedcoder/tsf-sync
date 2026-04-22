@@ -48,7 +48,8 @@ Each patch registers the WiFi card's TSF counter as a PTP hardware clock (`/dev/
 | ath9k | AR9xxx | Register (AR_TSF_L32/U32) | get/set/adj | v6.12 ✓, net-next ✓ |
 | ath10k | QCA988x, QCA6174, QCA9377, QCA9984 | WMI firmware | get/adj | v6.12 ✓, net-next ✓ |
 | ath11k | QCA6390, QCN9074, WCN6855, IPQ8074 | WMI firmware | adj only | v6.12 ✓, net-next ✓ |
-| mt76 | MT7915/7916/7986, MT7996, MT7921/7922/7925 | Per-chipset callbacks | get/set/adj + crosststamp | v6.12 ✓, net-next ✓ |
+| mt76 | MT7915/7916/7986, MT7996, MT7921/7922 | Per-chipset callbacks | get/set/adj + crosststamp | v6.12 ✓, net-next ✓ |
+| mt76 (mt7925) | — (chip excluded) | — | — | Unsupportable via this patch series — see [status.md §mt7925 TSF findings](status.md#mt7925-tsf-findings-2026-04-21) |
 | rtw88 | RTL8822BE/CE, RTL8723DE, RTL8821CE | Register (0x0560/0x0564) | get/set/adj | v6.12 ✓, net-next ✓ |
 | rtw89 | RTL8852AE/BE, RTL8851BE | Register (R_AX_TSFTR_P0) | get/set/adj | v6.12 ✓, net-next ✓ |
 
@@ -157,7 +158,9 @@ drivers/net/wireless/ath/ath11k/ptp.h    |  21 +++  (new)
 
 ## mt76 — MediaTek MT7915/7921/7996
 
-Common PTP implementation at the `mt76_dev` level with per-chipset TSF access abstracted via `mt76_ptp_ops` callbacks. This handles the diversity of MediaTek's lineup: mt7915/mt7996 and mt7921/mt7922/mt7925 all use direct MMIO to `MT_LPON_UTTR0/UTTR1` (paired with an `MT_LPON_TCR` software-read/write handshake) — the `mt792x` family reuses the same TSF-register layout as mt7915, not MCU commands. The only driver that implements `getcrosststamp`, providing system-to-device clock correlation.
+Common PTP implementation at the `mt76_dev` level with per-chipset TSF access abstracted via `mt76_ptp_ops` callbacks. mt7915/mt7996 and mt7921/mt7922 all use direct MMIO to `MT_LPON_UTTR0/UTTR1` (paired with an `MT_LPON_TCR` software-read/write handshake); the `mt792x` family (mt7921/mt7922) reuses the same TSF-register layout as mt7915, not MCU commands. The only driver that implements `getcrosststamp`, providing system-to-device clock correlation.
+
+> **mt7925 exclusion (2026-04-21):** mt7925 shares the `mt792x` core but its LPON TSF mirror is not populated by firmware — reads return 0 even after a confirmed `MT_LPON_TCR` SW_MODE latch writeback. There is no MCU TSF command in the mt7925 firmware interface (`TWT_AGRT_GET_TSF` is mt7996/mt7915 only). Patch 0004 registers `mt76_ptp_ops` for mt7921/mt7922 only; patch 0005 ships the `tsf_probe` debugfs that reproduces the failure (`/sys/kernel/debug/ieee80211/phyN/mt76/tsf_probe`). Full write-up in [status.md §mt7925 TSF findings](status.md#mt7925-tsf-findings-2026-04-21).
 
 **PTP operations:**
 
@@ -181,7 +184,8 @@ Common PTP implementation at the `mt76_dev` level with per-chipset TSF access ab
 |---------|--------|-----------|
 | MT7915/7916/7986 | Direct register | MT_LPON_UTTR0/UTTR1 |
 | MT7996 | Direct register | Register-based TSF |
-| MT7921/7922/7925 | Direct register | MT_LPON_UTTR0/UTTR1 (shared `mt792x_get_tsf`/`mt792x_set_tsf`) |
+| MT7921/7922 | Direct register | MT_LPON_UTTR0/UTTR1 (shared `mt792x_get_tsf`/`mt792x_set_tsf`) |
+| MT7925 | **Not supported** | LPON mirror exists in the register map but reads as 0 on real silicon; no MCU fallback |
 
 **Files changed (4 files, +164):**
 
