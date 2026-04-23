@@ -48,6 +48,11 @@
         # Helper scripts
         scripts = import ./nix/scripts.nix { inherit pkgs kernelModule package; };
 
+        # mt7925 TSF write-path diagnostic scripts (companion to patches
+        # 0005/0006). Runs on real hardware only; exposed as apps on
+        # every system but will refuse on non-Linux at runtime.
+        mt7925TsfTest = import ./nix/mt7925-tsf-test.nix { inherit pkgs; };
+
         # ─── Cross-compilation (x86_64-linux host only) ────────────────
         crossTargetDefs = {
           aarch64-linux = {
@@ -94,7 +99,7 @@
           default = package;
           tsf-sync = package;
           kernel-module = kernelModule;
-        } // scripts // crossPackages
+        } // scripts // mt7925TsfTest // crossPackages
           // (microvmTests.packages or {})
           // (patchInfra.packages or {})
           // (patchTest.packages or {});
