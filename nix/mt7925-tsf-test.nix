@@ -3,36 +3,40 @@
 # diagnosis described in patches/net-next/mt76/0006.
 #
 # These scripts exercise the `tsf_set` debugfs knob on an mt7925 AP vif
-# and observe the on-air beacon TSF from a second radio put briefly into
-# monitor mode. Decides whether mt792x_set_tsf's write path reaches the
-# on-chip TSF counter (the one that stamps beacon bodies) even though
-# the LPON UTTR read mirror is not populated -- see
+# and observe the on-air beacon TSF from a monitor vif added alongside
+# the AP on the SAME phy. Decides whether mt792x_set_tsf's write path
+# reaches the on-chip TSF counter (the one that stamps beacon bodies)
+# even though the LPON UTTR read mirror is not populated -- see
 # docs/mt7925-tsf-findings.md for why this matters.
 #
-# All scripts default to the l2 test-rig layout (target=phy0, observer=
-# phy1) but accept overrides via env vars so they work on other rigs:
+# Why same-phy monitor instead of a sibling radio:
+# On the l2 rig, all four APs are managed by a single hostapd-multi
+# instance. Tearing down one interface (even on a different phy) makes
+# hostapd-multi exit; systemd restarts it, but the restart transitions
+# every AP through STATION state briefly, and the target stops beaconing
+# long enough to break the capture. Adding `monN` as a second vif on the
+# target phy itself (mt76 supports AP + monitor on one phy, inheriting
+# the AP's channel) avoids hostapd entirely and captures the beacons the
+# target is transmitting.
 #
-#   TARGET_PHY     phy holding the AP whose TSF we want to probe/write
+# Env-var overrides (l2-rig defaults shown):
+#
+#   TARGET_PHY     phy holding the AP we want to probe/write
 #                  (default: phy0)
-#   OBSERVER_PHY   phy we temporarily repurpose as a monitor
-#                  (default: phy1)
+#   MONITOR_IFACE  name of the monitor vif we add on TARGET_PHY
+#                  (default: mon0)
 #   TEST_VALUE     u64 written to tsf_set in µs (default: 99999999999999)
-#   DURATION       seconds per tshark capture window (default: 3)
+#   DURATION       max seconds per tshark capture window (default: 3)
 #   BEACONS        beacons to capture per window (default: 3)
-#
-# The target MAC, channel and observer-AP interface name are auto-
-# discovered from `iw dev`, so the only invariant is that $TARGET_PHY
-# has a live AP and $OBSERVER_PHY has something we are allowed to tear
-# down.
 #
 # Usage:
 #
 #   sudo nix run .#mt7925-tsf-probe              # dump tsf_probe output
 #   sudo nix run .#mt7925-tsf-set -- 1234        # echo value into tsf_set
-#   sudo nix run .#mt7925-tsf-monitor-setup      # bring up monitor mon1
-#   sudo nix run .#mt7925-tsf-monitor-teardown   # tear it down
-#   sudo nix run .#mt7925-tsf-capture            # capture beacons once
-#   sudo nix run .#mt7925-tsf-test               # full before/write/after
+#   sudo nix run .#mt7925-tsf-monitor-setup      # add mon0 on TARGET_PHY
+#   sudo nix run .#mt7925-tsf-monitor-teardown   # remove mon0
+#   sudo nix run .#mt7925-tsf-capture            # tshark beacons once
+#   sudo nix run .#mt7925-tsf-test               # full BEFORE/WRITE/AFTER
 #
 { pkgs }:
 
@@ -47,8 +51,7 @@ let
     fi
 
     TARGET_PHY=''${TARGET_PHY:-phy0}
-    OBSERVER_PHY=''${OBSERVER_PHY:-phy1}
-    MONITOR_IFACE=''${MONITOR_IFACE:-mon1}
+    MONITOR_IFACE=''${MONITOR_IFACE:-mon0}
     TEST_VALUE=''${TEST_VALUE:-99999999999999}
     DURATION=''${DURATION:-3}
     BEACONS=''${BEACONS:-3}
@@ -63,20 +66,21 @@ let
         END { if (is_ap && mac && freq) print mac, freq; else exit 1 }'
     }
 
-    discover_observer_iface() {
-      # Prints the first interface name on $OBSERVER_PHY.
-      iw dev | awk -v phy="''${OBSERVER_PHY#phy}" '
-        /^phy#/ { p = $0; sub(/phy#/, "", p); next }
-        p == phy && /^[[:space:]]*Interface / { print $2; exit }'
+    preflight_ap() {
+      # Abort loudly if the target is not currently an AP. Protects against
+      # running the capture path when hostapd has just restarted the vif.
+      if ! discover_target >/dev/null 2>&1; then
+        echo "error: no AP vif on $TARGET_PHY. Check with 'iw dev' and" >&2
+        echo "       restart hostapd-multi if needed, then retry." >&2
+        exit 1
+      fi
     }
   '';
 
   runtimeDeps = with pkgs; [ iw iproute2 wireshark-cli coreutils gawk gnugrep ];
 in
 {
-  # Dump /sys/kernel/debug/ieee80211/$TARGET_PHY/mt76/tsf_probe (if
-  # patch 0005 is applied). Convenient wrapper -- tsf_probe is what
-  # patch 0005 registered and is read-only.
+  # Dump /sys/kernel/debug/ieee80211/$TARGET_PHY/mt76/tsf_probe.
   mt7925-tsf-probe = pkgs.writeShellApplication {
     name = "mt7925-tsf-probe";
     runtimeInputs = runtimeDeps;
@@ -90,8 +94,7 @@ in
     '';
   };
 
-  # Write $1 (or $TEST_VALUE) to tsf_set. The file appears only if
-  # patch 0006 is applied.
+  # Write $1 (or $TEST_VALUE) to tsf_set.
   mt7925-tsf-set = pkgs.writeShellApplication {
     name = "mt7925-tsf-set";
     runtimeInputs = runtimeDeps;
@@ -108,37 +111,35 @@ in
     '';
   };
 
-  # Repurpose $OBSERVER_PHY as a monitor vif on $TARGET_PHY's channel.
-  # Tears down whatever interface $OBSERVER_PHY is currently hosting.
+  # Add $MONITOR_IFACE as a second vif on $TARGET_PHY (same phy as the
+  # AP). It inherits the AP's channel, so it sees the AP's own beacons
+  # without anyone changing channel. Does NOT touch any AP or hostapd.
   mt7925-tsf-monitor-setup = pkgs.writeShellApplication {
     name = "mt7925-tsf-monitor-setup";
     runtimeInputs = runtimeDeps;
     text = common + ''
+      preflight_ap
       read -r TARGET_MAC TARGET_FREQ < <(discover_target)
-      echo "==> target: $TARGET_PHY mac=$TARGET_MAC freq=$TARGET_FREQ MHz"
-
-      OBS_IFACE=$(discover_observer_iface || true)
-      if [ -n "$OBS_IFACE" ] && [ "$OBS_IFACE" != "$MONITOR_IFACE" ]; then
-        echo "==> tearing down $OBS_IFACE on $OBSERVER_PHY"
-        ip link set "$OBS_IFACE" down 2>/dev/null || true
-        iw dev "$OBS_IFACE" del 2>/dev/null || true
-      fi
+      echo "==> target AP: $TARGET_PHY mac=$TARGET_MAC freq=$TARGET_FREQ MHz"
 
       if iw dev "$MONITOR_IFACE" info >/dev/null 2>&1; then
-        echo "==> $MONITOR_IFACE already exists, leaving it"
+        echo "==> $MONITOR_IFACE already exists, reusing"
       else
-        echo "==> creating $MONITOR_IFACE on $OBSERVER_PHY"
-        iw phy "$OBSERVER_PHY" interface add "$MONITOR_IFACE" type monitor
+        echo "==> iw phy $TARGET_PHY interface add $MONITOR_IFACE type monitor"
+        if ! iw phy "$TARGET_PHY" interface add "$MONITOR_IFACE" type monitor 2>&1; then
+          echo "error: adding monitor vif on $TARGET_PHY failed" >&2
+          echo "       mt7925 firmware may not allow concurrent AP+monitor on one phy." >&2
+          exit 1
+        fi
       fi
 
+      echo "==> ip link set $MONITOR_IFACE up"
       ip link set "$MONITOR_IFACE" up
-      iw dev "$MONITOR_IFACE" set freq "$TARGET_FREQ"
-      echo "==> $MONITOR_IFACE up on $TARGET_FREQ MHz"
+      echo "==> $MONITOR_IFACE ready (inherits $TARGET_PHY channel)"
+      iw dev "$MONITOR_IFACE" info | sed 's/^/    /'
     '';
   };
 
-  # Remove $MONITOR_IFACE. Does not restore the sacrificed AP vif --
-  # a rebuild/reboot or hostapd-multi restart does that.
   mt7925-tsf-monitor-teardown = pkgs.writeShellApplication {
     name = "mt7925-tsf-monitor-teardown";
     runtimeInputs = runtimeDeps;
@@ -153,14 +154,13 @@ in
     '';
   };
 
-  # Capture $BEACONS beacons from the target BSSID via $MONITOR_IFACE
-  # and print two columns: frame.time_relative, beacon-body TSF (µs).
-  # wlan.fixed.timestamp is stamped by the transmitter's hardware at
-  # TX time, so it reflects the on-chip TSF counter of $TARGET_PHY.
+  # Capture $BEACONS beacons from the target BSSID via $MONITOR_IFACE.
+  # tshark stderr is preserved so capture failures are visible.
   mt7925-tsf-capture = pkgs.writeShellApplication {
     name = "mt7925-tsf-capture";
     runtimeInputs = runtimeDeps;
     text = common + ''
+      preflight_ap
       read -r TARGET_MAC _TARGET_FREQ < <(discover_target)
 
       if ! iw dev "$MONITOR_IFACE" info >/dev/null 2>&1; then
@@ -168,23 +168,24 @@ in
         exit 1
       fi
 
-      echo "==> capture ($BEACONS beacons, max ''${DURATION}s) from $TARGET_MAC"
-      tshark -i "$MONITOR_IFACE" -I -n -l \
+      echo "==> capture ($BEACONS beacons, max ''${DURATION}s) from $TARGET_MAC via $MONITOR_IFACE"
+      tshark -i "$MONITOR_IFACE" -n -l \
         -Y "wlan.fc.type_subtype == 0x08 && wlan.bssid == $TARGET_MAC" \
-        -T fields -e frame.time_relative -e wlan.fixed.timestamp \
-        -c "$BEACONS" -a "duration:$DURATION" 2>/dev/null
+        -T fields -e frame.time_relative -e wlan.bssid -e wlan.fixed.timestamp \
+        -c "$BEACONS" -a "duration:$DURATION"
     '';
   };
 
-  # End-to-end: setup monitor, capture BEFORE, write TEST_VALUE, capture
-  # AFTER, teardown. Printable diff makes the verdict obvious:
+  # End-to-end: add monitor, capture BEFORE, write TEST_VALUE, capture
+  # AFTER, teardown. Verdict is obvious from the two TSF columns:
   #
-  #   - AFTER jumps to ~TEST_VALUE  => write path reaches on-chip TSF.
-  #   - AFTER continues from BEFORE => write path is also dead silicon.
+  #   AFTER jumps ~TEST_VALUE   => write path reaches on-chip TSF.
+  #   AFTER ≈ BEFORE + 100ms    => write path is also dead silicon.
   mt7925-tsf-test = pkgs.writeShellApplication {
     name = "mt7925-tsf-test";
     runtimeInputs = runtimeDeps;
     text = common + ''
+      preflight_ap
       read -r TARGET_MAC TARGET_FREQ < <(discover_target)
       SETF="/sys/kernel/debug/ieee80211/''${TARGET_PHY}/mt76/tsf_set"
 
@@ -195,13 +196,11 @@ in
 
       echo "=================================================================="
       echo "  mt7925 TSF write-path diagnosis"
-      echo "  target : $TARGET_PHY ($TARGET_MAC @ $TARGET_FREQ MHz)"
-      echo "  observer: $OBSERVER_PHY -> $MONITOR_IFACE"
-      echo "  value  : $TEST_VALUE"
+      echo "  target  : $TARGET_PHY ($TARGET_MAC @ $TARGET_FREQ MHz)"
+      echo "  monitor : $MONITOR_IFACE (same phy, inherits channel)"
+      echo "  value   : $TEST_VALUE"
       echo "=================================================================="
 
-      # setup (inline -- we want one trap)
-      OBS_IFACE=$(discover_observer_iface || true)
       cleanup() {
         echo ""
         echo "==> teardown"
@@ -210,20 +209,22 @@ in
       }
       trap cleanup EXIT
 
-      if [ -n "$OBS_IFACE" ] && [ "$OBS_IFACE" != "$MONITOR_IFACE" ]; then
-        ip link set "$OBS_IFACE" down 2>/dev/null || true
-        iw dev "$OBS_IFACE" del 2>/dev/null || true
+      if iw dev "$MONITOR_IFACE" info >/dev/null 2>&1; then
+        echo "==> $MONITOR_IFACE already exists, reusing"
+      else
+        if ! iw phy "$TARGET_PHY" interface add "$MONITOR_IFACE" type monitor 2>&1; then
+          echo "error: adding monitor vif failed" >&2
+          exit 1
+        fi
       fi
-      iw phy "$OBSERVER_PHY" interface add "$MONITOR_IFACE" type monitor
       ip link set "$MONITOR_IFACE" up
-      iw dev "$MONITOR_IFACE" set freq "$TARGET_FREQ"
 
       echo ""
       echo "=== BEFORE ==="
-      tshark -i "$MONITOR_IFACE" -I -n -l \
+      tshark -i "$MONITOR_IFACE" -n -l \
         -Y "wlan.fc.type_subtype == 0x08 && wlan.bssid == $TARGET_MAC" \
-        -T fields -e frame.time_relative -e wlan.fixed.timestamp \
-        -c "$BEACONS" -a "duration:$DURATION" 2>/dev/null
+        -T fields -e frame.time_relative -e wlan.bssid -e wlan.fixed.timestamp \
+        -c "$BEACONS" -a "duration:$DURATION"
 
       echo ""
       echo "=== WRITE $TEST_VALUE -> $SETF ==="
@@ -231,10 +232,10 @@ in
 
       echo ""
       echo "=== AFTER ==="
-      tshark -i "$MONITOR_IFACE" -I -n -l \
+      tshark -i "$MONITOR_IFACE" -n -l \
         -Y "wlan.fc.type_subtype == 0x08 && wlan.bssid == $TARGET_MAC" \
-        -T fields -e frame.time_relative -e wlan.fixed.timestamp \
-        -c "$BEACONS" -a "duration:$DURATION" 2>/dev/null
+        -T fields -e frame.time_relative -e wlan.bssid -e wlan.fixed.timestamp \
+        -c "$BEACONS" -a "duration:$DURATION"
 
       echo ""
       echo "=== tsf_probe (read path, known-dead; for completeness) ==="
