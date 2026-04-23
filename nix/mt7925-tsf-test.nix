@@ -9,22 +9,24 @@
 # even though the LPON UTTR read mirror is not populated -- see
 # docs/mt7925-tsf-findings.md for why this matters.
 #
-# Why same-phy monitor instead of a sibling radio:
-# On the l2 rig, all four APs are managed by a single hostapd-multi
-# instance. Tearing down one interface (even on a different phy) makes
-# hostapd-multi exit; systemd restarts it, but the restart transitions
-# every AP through STATION state briefly, and the target stops beaconing
-# long enough to break the capture. Adding `monN` as a second vif on the
-# target phy itself (mt76 supports AP + monitor on one phy, inheriting
-# the AP's channel) avoids hostapd entirely and captures the beacons the
-# target is transmitting.
+# Observer strategy: mt7925 is half-duplex and does NOT loop its own
+# transmitted beacons back to a co-resident monitor vif on the same
+# phy, so we use a sibling radio. On the l2 rig both wls1 (phy0) and
+# wls2 (phy1) are configured on ch36 specifically so phy1 can host a
+# secondary monitor vif (`mon1`) that inherits ch36 and hears phy0's
+# beacons. The monitor vif is added alongside phy1's existing AP --
+# hostapd-multi is never disturbed.
 #
 # Env-var overrides (l2-rig defaults shown):
 #
 #   TARGET_PHY     phy holding the AP we want to probe/write
 #                  (default: phy0)
-#   MONITOR_IFACE  name of the monitor vif we add on TARGET_PHY
-#                  (default: mon0)
+#   MONITOR_PHY    phy we add the monitor vif on. Must be a DIFFERENT
+#                  phy than TARGET_PHY and must already be operating
+#                  on the same channel (monitor vifs inherit the phy's
+#                  current channel). (default: phy1)
+#   MONITOR_IFACE  name of the monitor vif we add on MONITOR_PHY
+#                  (default: mon1)
 #   TEST_VALUE     u64 written to tsf_set in µs (default: 99999999999999)
 #   DURATION       max seconds per tshark capture window (default: 3)
 #   BEACONS        beacons to capture per window (default: 3)
@@ -51,19 +53,30 @@ let
     fi
 
     TARGET_PHY=''${TARGET_PHY:-phy0}
-    MONITOR_IFACE=''${MONITOR_IFACE:-mon0}
+    MONITOR_PHY=''${MONITOR_PHY:-phy1}
+    MONITOR_IFACE=''${MONITOR_IFACE:-mon1}
     TEST_VALUE=''${TEST_VALUE:-99999999999999}
     DURATION=''${DURATION:-3}
     BEACONS=''${BEACONS:-3}
 
-    discover_target() {
-      # Prints "$mac $freq" for the AP vif on $TARGET_PHY.
-      iw dev | awk -v phy="''${TARGET_PHY#phy}" '
+    if [ "$TARGET_PHY" = "$MONITOR_PHY" ]; then
+      echo "error: TARGET_PHY and MONITOR_PHY must differ (mt7925 does not" >&2
+      echo "       self-loop beacons to a co-resident monitor vif)." >&2
+      exit 1
+    fi
+
+    # Prints "$mac $freq" for the AP vif on $1 (a phy name, e.g. phy0).
+    discover_ap_on_phy() {
+      iw dev | awk -v phy="''${1#phy}" '
         /^phy#/ { p = $0; sub(/phy#/, "", p); next }
         p == phy && /^[[:space:]]*addr / { mac = $2 }
         p == phy && /^[[:space:]]*channel / { freq = $3; sub(/\(/, "", freq) }
         p == phy && /^[[:space:]]*type AP/ { is_ap = 1 }
         END { if (is_ap && mac && freq) print mac, freq; else exit 1 }'
+    }
+
+    discover_target() {
+      discover_ap_on_phy "$TARGET_PHY"
     }
 
     preflight_ap() {
@@ -72,6 +85,26 @@ let
       if ! discover_target >/dev/null 2>&1; then
         echo "error: no AP vif on $TARGET_PHY. Check with 'iw dev' and" >&2
         echo "       restart hostapd-multi if needed, then retry." >&2
+        exit 1
+      fi
+    }
+
+    preflight_monitor_phy() {
+      # Abort if MONITOR_PHY is not on the same channel as TARGET_PHY --
+      # a monitor vif inherits its phy's channel, so cross-channel phys
+      # cannot observe each other.
+      local tgt_freq mon_freq
+      tgt_freq=$(discover_ap_on_phy "$TARGET_PHY" | awk '{print $2}')
+      mon_freq=$(discover_ap_on_phy "$MONITOR_PHY" | awk '{print $2}')
+      if [ -z "$mon_freq" ]; then
+        echo "error: no AP vif on $MONITOR_PHY -- monitor vif would have no" >&2
+        echo "       channel to inherit. Configure an AP on $MONITOR_PHY first." >&2
+        exit 1
+      fi
+      if [ "$tgt_freq" != "$mon_freq" ]; then
+        echo "error: $TARGET_PHY is on $tgt_freq MHz but $MONITOR_PHY is on" >&2
+        echo "       $mon_freq MHz. They must share a channel -- adjust" >&2
+        echo "       hostapd-multi.nix so both phys are co-channel." >&2
         exit 1
       fi
     }
@@ -111,23 +144,26 @@ in
     '';
   };
 
-  # Add $MONITOR_IFACE as a second vif on $TARGET_PHY (same phy as the
-  # AP). It inherits the AP's channel, so it sees the AP's own beacons
-  # without anyone changing channel. Does NOT touch any AP or hostapd.
+  # Add $MONITOR_IFACE as a second vif on $MONITOR_PHY (sibling radio,
+  # co-channel with $TARGET_PHY). The monitor vif inherits its phy's
+  # current channel, so it sees $TARGET_PHY's beacons without anyone
+  # changing channel. Does NOT touch any AP or hostapd.
   mt7925-tsf-monitor-setup = pkgs.writeShellApplication {
     name = "mt7925-tsf-monitor-setup";
     runtimeInputs = runtimeDeps;
     text = common + ''
       preflight_ap
+      preflight_monitor_phy
       read -r TARGET_MAC TARGET_FREQ < <(discover_target)
-      echo "==> target AP: $TARGET_PHY mac=$TARGET_MAC freq=$TARGET_FREQ MHz"
+      echo "==> target AP : $TARGET_PHY mac=$TARGET_MAC freq=$TARGET_FREQ MHz"
+      echo "==> monitor phy: $MONITOR_PHY (sibling, co-channel)"
 
       if iw dev "$MONITOR_IFACE" info >/dev/null 2>&1; then
         echo "==> $MONITOR_IFACE already exists, reusing"
       else
-        echo "==> iw phy $TARGET_PHY interface add $MONITOR_IFACE type monitor"
-        if ! iw phy "$TARGET_PHY" interface add "$MONITOR_IFACE" type monitor 2>&1; then
-          echo "error: adding monitor vif on $TARGET_PHY failed" >&2
+        echo "==> iw phy $MONITOR_PHY interface add $MONITOR_IFACE type monitor"
+        if ! iw phy "$MONITOR_PHY" interface add "$MONITOR_IFACE" type monitor 2>&1; then
+          echo "error: adding monitor vif on $MONITOR_PHY failed" >&2
           echo "       mt7925 firmware may not allow concurrent AP+monitor on one phy." >&2
           exit 1
         fi
@@ -135,7 +171,7 @@ in
 
       echo "==> ip link set $MONITOR_IFACE up"
       ip link set "$MONITOR_IFACE" up
-      echo "==> $MONITOR_IFACE ready (inherits $TARGET_PHY channel)"
+      echo "==> $MONITOR_IFACE ready (inherits $MONITOR_PHY channel)"
       iw dev "$MONITOR_IFACE" info | sed 's/^/    /'
     '';
   };
@@ -186,6 +222,7 @@ in
     runtimeInputs = runtimeDeps;
     text = common + ''
       preflight_ap
+      preflight_monitor_phy
       read -r TARGET_MAC TARGET_FREQ < <(discover_target)
       SETF="/sys/kernel/debug/ieee80211/''${TARGET_PHY}/mt76/tsf_set"
 
@@ -197,7 +234,7 @@ in
       echo "=================================================================="
       echo "  mt7925 TSF write-path diagnosis"
       echo "  target  : $TARGET_PHY ($TARGET_MAC @ $TARGET_FREQ MHz)"
-      echo "  monitor : $MONITOR_IFACE (same phy, inherits channel)"
+      echo "  monitor : $MONITOR_IFACE on $MONITOR_PHY (sibling, co-channel)"
       echo "  value   : $TEST_VALUE"
       echo "=================================================================="
 
@@ -212,7 +249,7 @@ in
       if iw dev "$MONITOR_IFACE" info >/dev/null 2>&1; then
         echo "==> $MONITOR_IFACE already exists, reusing"
       else
-        if ! iw phy "$TARGET_PHY" interface add "$MONITOR_IFACE" type monitor 2>&1; then
+        if ! iw phy "$MONITOR_PHY" interface add "$MONITOR_IFACE" type monitor 2>&1; then
           echo "error: adding monitor vif failed" >&2
           exit 1
         fi
