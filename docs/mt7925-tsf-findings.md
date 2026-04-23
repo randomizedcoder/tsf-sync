@@ -1,7 +1,11 @@
 # MT7925 TSF Investigation
 
-> **Status:** confirmed dead hardware path. See §[Verdict](#verdict) and §[Critical
-> open question: does `set_tsf` work?](#critical-open-question-does-set_tsf-work).
+> **Status:** confirmed dead hardware path, **both directions**. Read via
+> `mt792x_get_tsf` returns 0 (LPON UTTR mirror never populated); write via
+> `mt792x_set_tsf` lands in registers but does not reach the on-chip TSF
+> counter that stamps beacon bodies (empirically verified on 2026-04-22).
+> See §[Verdict](#verdict) and §[Critical open question: does `set_tsf`
+> work?](#critical-open-question-does-set_tsf-work).
 >
 > **Last updated:** 2026-04-22
 
@@ -393,6 +397,61 @@ is trivially low-risk.
 - No new patches — a small extension of 0005's `tsf_probe` debugfs is
   sufficient.
 
+### Verdict (2026-04-22): `set_tsf` is also dead silicon
+
+Test executed on the l2 rig with patch 0006's `tsf_set` debugfs knob and a
+cross-card beacon capture (wls1 on phy0 as the target AP, phy1 converted to
+a dedicated monitor vif on the same channel — mt7925 is half-duplex and does
+not loop its own TX beacons to a co-resident monitor vif on the same phy,
+so the observer must be a sibling radio). Commands and script that produced
+the verdict are reproducible via `sudo nix run .#mt7925-tsf-test` from this
+repo, with the rig configured via the companion change to
+`l2/hostapd-multi.nix` putting wls1 and wls2 co-channel on ch36.
+
+**Empirical data — beacon-body TSF field (`wlan.fixed.timestamp`) captured
+from wls1 BSSID 0c:cd:b4:38:73:01 via mon1 on phy1:**
+
+```
+=== BEFORE ===
+t=0.063  tsf=297,984,064
+t=0.165  tsf=298,086,462
+t=0.267  tsf=298,188,863
+
+=== WRITE 99,999,999,999,999 to /sys/kernel/debug/ieee80211/phy0/mt76/tsf_set ===
+(write OK, no driver error)
+
+=== AFTER ===
+t=0.063  tsf=298,700,877
+t=0.165  tsf=298,803,273
+t=0.267  tsf=298,905,673
+
+=== tsf_probe (post-write) ===
+vif 0c:cd:b4:38:73:01 type=3 omac_idx=0 n=0
+  get_tsf        = 0x0000000000000000 (0)
+  TCR before     = 0x01640007
+  TCR after      = 0x01640007
+  UTTR0 (post)   = 0x00000000
+  UTTR1 (post)   = 0x00000000
+```
+
+**Interpretation.** The AFTER beacons continue the natural progression of
+the BEFORE sequence (+~102,400 µs per beacon interval, +~512 ms total
+elapsed between captures). If the `MT_LPON_UTTR0/1` write + `MT_LPON_TCR`
+SW_WRITE latch had reached the hardware TSF counter that stamps beacons,
+the first AFTER value would be ≈ 99,999,999,999,999 + (~100 ms beacon
+interval) ≈ 100,000,000,100,000. It is instead 298,700,877 — indistinguishable
+from "no write happened". Simultaneously, `tsf_probe` confirms UTTR0/UTTR1
+still read 0 post-write, meaning firmware does not populate the register
+mirror in either direction.
+
+This matches the "Beacon TSF field does not change" row in the test matrix
+above. **No approach using `mt792x_set_tsf` + beacon-body TSF can produce
+hardware TSF alignment on mt7925.** The only remaining categories are
+alternative on-chip TSF sample sources (RX-descriptor timestamps, TX-status
+timestamps) feeding a software-only affine-mapping layer — which is useful
+for scheduling against an external reference but does not give on-air EDCA
+slot alignment across mt7925 radios.
+
 ---
 
 ## Options going forward
@@ -400,8 +459,9 @@ is trivially low-risk.
 Given all of the above, three sequenced questions drive the next phase of
 work:
 
-1. **Does `set_tsf` work on mt7925?** (The `tsf_probe` write-test above.) If
-   yes, go to step 2. If no, skip to step 4.
+1. ~~**Does `set_tsf` work on mt7925?**~~ **Answered 2026-04-22: no.** See
+   §[Verdict (2026-04-22)](#verdict-2026-04-22-set_tsf-is-also-dead-silicon).
+   Skip to step 4.
 
 2. **What's the best alternative read source?** RX-descriptor beacon
    timestamps are the front-runner. Reading the mt76 RX path for mt7925 and
